@@ -1,6 +1,6 @@
 mod uniswap;
 
-use ethers::{middleware::{SignerMiddleware, Middleware}, providers::Provider, signers::{Wallet,Signer}};
+use ethers::{middleware::{SignerMiddleware, Middleware}, providers::{Provider, Http}, signers::{Wallet,Signer}};
 
 use ethers::{prelude::abigen, types::Address};
 use std::sync::Arc;
@@ -12,7 +12,7 @@ async fn main() -> eyre::Result<()> {
   let wallet = Wallet::try_from(
     "0xe30749948a5e0bc4f6c01bc2b31330ddf67dacd09c25d488b9e45e51b1c117d1".to_string(),
   )?;
-  let provider: Provider<ethers::providers::Http> = Provider::try_from(rpc_url)?;
+  let provider: Provider<ethers::providers::Http> = Provider::<Http>::try_from(rpc_url)?;
   let client = SignerMiddleware::new(provider, wallet);
 
   let u = uniswap::Uniswap::new(client, "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?, "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".parse()?);
