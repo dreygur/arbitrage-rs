@@ -8,3 +8,7 @@ use ethers::{
   solc::Solc,
 };
 use eyre::Result;
+
+pub struct EthWallet {
+
+}
