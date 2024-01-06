@@ -1,9 +1,12 @@
 use ethers::{
-  prelude::{abigen, SignerMiddleware},
+  prelude::abigen,
   providers::{Http, Provider},
+  middleware::{Middleware, SignerMiddleware},
+  signers::Signer,
   types::Address,
 };
 use std::sync::Arc;
+
 
 // Uniswap V2 Router
 abigen!(
@@ -18,14 +21,15 @@ abigen!(
   ]"
 );
 
-pub fn router_v2<M, S>(
-  provider: SignerMiddleware<Provider<Http>, S>,
-) -> eyre::Result<IUniswapV2Router<Provider<Http>>> {
+pub fn router_v2<M: Middleware, S: Signer>(
+  provider: SignerMiddleware<M, S>,
+) -> eyre::Result<IUniswapV2Router<SignerMiddleware<M, S>>> {
   // Initialize a new instance of the Weth/Dai Uniswap V2 pair contract
   let p = Arc::new(provider);
   let pair_address: Address = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?;
   Ok(IUniswapV2Router::new(pair_address, p))
 }
+
 
 // Uniswap V2 Factory
 abigen!(

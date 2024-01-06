@@ -1,5 +1,8 @@
 mod uniswap;
-use ethers::{middleware::SignerMiddleware, providers::Provider, signers::Wallet};
+use ethers::{middleware::{SignerMiddleware, Middleware}, providers::Provider, signers::{Wallet,Signer}};
+
+use ethers::{prelude::abigen, types::Address};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -12,7 +15,7 @@ async fn main() -> eyre::Result<()> {
 
   let a = uniswap::router_v2(client.clone());
   // Use the get_reserves() function to fetch the pool reserves
-  let c = a
+  let c = a.expect("REASON")
     .get_amounts_out(
       "1000000000000000".parse()?,
       vec![
@@ -22,7 +25,7 @@ async fn main() -> eyre::Result<()> {
     )
     .call()
     .await?;
-  println!("{:?}", c[0]);
+  println!("{:?}", c);
 
   Ok(())
 }
