@@ -1,12 +1,10 @@
 use ethers::{
   prelude::abigen,
-  providers::{Http, Provider},
   middleware::{Middleware, SignerMiddleware},
   signers::Signer,
   types::Address,
 };
 use std::sync::Arc;
-
 
 // Uniswap V2 Router
 abigen!(
@@ -21,28 +19,11 @@ abigen!(
   ]"
 );
 
-pub fn router_v2<M: Middleware, S: Signer>(
-  provider: SignerMiddleware<M, S>,
-) -> eyre::Result<IUniswapV2Router<SignerMiddleware<M, S>>> {
-  // Initialize a new instance of the Weth/Dai Uniswap V2 pair contract
-  let p = Arc::new(provider);
-  let pair_address: Address = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?;
-  Ok(IUniswapV2Router::new(pair_address, p))
-}
-
-
 // Uniswap V2 Factory
 abigen!(
   IUniswapV2Factory,
   "[event PairCreated(address indexed token0, address indexed token1, address pair, uint)]"
 );
-
-pub fn factory_v2(provider: Provider<Http>) -> eyre::Result<IUniswapV2Factory<Provider<Http>>> {
-  // Initialize a new instance of the Weth/Dai Uniswap V2 pair contract
-  let p = Arc::new(provider.clone());
-  let factory_address: Address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".parse()?;
-  Ok(IUniswapV2Factory::new(factory_address, p))
-}
 
 // Uniswap V2 Pair
 abigen!(
@@ -53,9 +34,32 @@ abigen!(
   ]"
 );
 
-pub fn pair_v2(provider: Provider<Http>) -> eyre::Result<IUniswapV2Pair<Provider<Http>>> {
-  // Initialize a new instance of the Weth/Dai Uniswap V2 pair contract
-  let p = Arc::new(provider.clone());
-  let pair_address: Address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".parse()?;
-  Ok(IUniswapV2Pair::new(pair_address, p))
+#[derive(Debug,Clone)]
+pub struct Uniswap<M: Middleware, S: Signer> {
+  pub provider: Arc<SignerMiddleware<M, S>>,
+  pub router: Address,
+  pub factory: Address,
 }
+
+impl<M: Middleware, S: Signer> Uniswap<M, S> {
+  pub fn new(provider: SignerMiddleware<M, S>, router: Address, factory: Address) -> Self {
+    Self {
+      provider: Arc::new(provider),
+      router,
+      factory,
+    }
+  }
+
+  pub fn router_v2(&self) -> eyre::Result<IUniswapV2Router<SignerMiddleware<M, S>>> {
+    Ok(IUniswapV2Router::new(self.router, self.provider.clone()))
+  }
+
+  pub fn factory_v2(&self) -> eyre::Result<IUniswapV2Factory<SignerMiddleware<M, S>>> {
+    Ok(IUniswapV2Factory::new(self.factory, self.provider.clone()))
+  }
+
+  pub fn pair_v2(&self, pair: Address) -> eyre::Result<IUniswapV2Pair<SignerMiddleware<M, S>>> {
+    Ok(IUniswapV2Pair::new(pair, self.provider.clone()))
+  }
+}
+

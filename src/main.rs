@@ -13,8 +13,10 @@ async fn main() -> eyre::Result<()> {
   let provider: Provider<ethers::providers::Http> = Provider::try_from(rpc_url)?;
   let client = SignerMiddleware::new(provider, wallet);
 
-  let a = uniswap::router_v2(client.clone());
+  let u = uniswap::Uniswap::new(client, "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?, "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".parse()?);
+  // let a = uniswap::router_v2(client.clone());
   // Use the get_reserves() function to fetch the pool reserves
+  let a = u.router_v2();
   let c = a.expect("REASON")
     .get_amounts_out(
       "1000000000000000".parse()?,
