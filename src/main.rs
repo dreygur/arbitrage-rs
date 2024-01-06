@@ -1,9 +1,6 @@
 mod uniswap;
 
-use ethers::{middleware::{SignerMiddleware, Middleware}, providers::{Provider, Http}, signers::{Wallet,Signer}};
-
-use ethers::{prelude::abigen, types::Address};
-use std::sync::Arc;
+use ethers::{middleware::{SignerMiddleware}, providers::{Provider, Http}, signers::{Wallet}};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
