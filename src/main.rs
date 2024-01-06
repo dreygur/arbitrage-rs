@@ -1,12 +1,16 @@
 mod uniswap;
-use ethers::providers::Provider;
+use ethers::{middleware::SignerMiddleware, providers::Provider, signers::Wallet};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-  let rpc_url = "https://eth.llamarpc.com";
+  let rpc_url = "http://127.0.0.1:8545";
+  let wallet = Wallet::try_from(
+    "0xe30749948a5e0bc4f6c01bc2b31330ddf67dacd09c25d488b9e45e51b1c117d1".to_string(),
+  )?;
   let provider: Provider<ethers::providers::Http> = Provider::try_from(rpc_url)?;
+  let client = SignerMiddleware::new(provider, wallet);
 
-  let a = uniswap::router_v2(provider)?;
+  let a = uniswap::router_v2(client.clone());
   // Use the get_reserves() function to fetch the pool reserves
   let c = a
     .get_amounts_out(
