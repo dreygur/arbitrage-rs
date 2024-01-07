@@ -27,9 +27,8 @@ async fn main() -> eyre::Result<()> {
     "0x45053C90301E8A2A6A1DF1F0791B553496Dd6c7f".parse()?
   );
 
-  // let u = uniswap::Uniswap::new(client, "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?, "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f".parse()?);
   let pair = arb_wallet.get_pair("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse()?,"0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE".parse()?).await?;
-  // println!("{:?}", pair.clone().get_reserves().call().await?);
+  println!("Reserves: {:?}", pair.clone().get_reserves().call().await?);
   let spender = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?;
   let value = "1000000000000000".parse()?;
   let binding = pair.approve(spender, value);
@@ -37,3 +36,4 @@ async fn main() -> eyre::Result<()> {
   println!("{:?}\nDone...", res);
   Ok(())
 }
+
