@@ -1,6 +1,12 @@
 mod uniswap;
+mod arbitrage;
+mod eth_wallet;
 
-use ethers::{middleware::{SignerMiddleware}, providers::{Provider, Http}, signers::{Wallet}};
+use ethers::{
+  middleware::SignerMiddleware,
+  providers::{Provider, Http},
+  signers::Wallet,
+};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
