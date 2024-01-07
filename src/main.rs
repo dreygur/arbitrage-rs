@@ -18,7 +18,7 @@ async fn main() -> eyre::Result<()> {
   let spender = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse()?;
   let value = "1000000000000000".parse()?;
   let binding = pair.approve(spender, value);
-   let res = binding.send().await?;
+   let res = binding.send().await?.await?;
   println!("{:?}\nDone...", res);
 
   // Use the get_reserves() function to fetch the pool reserves
