@@ -3,6 +3,9 @@ name = "arbitrage"
 version = "0.1.0"
 edition = "2021"
 
+[build]
+target-dir = "."
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -12,3 +15,10 @@ tokio = { version = "1", features = ["rt","rt-multi-thread","macros"] }
 # Flexible concrete Error Reporting type built on std::error::Error with customizable Reports
 eyre = "0.6"
 anyhow = "1.0.79"
+dotenv = "0.15.0"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
