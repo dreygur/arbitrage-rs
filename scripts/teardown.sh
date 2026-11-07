@@ -6,14 +6,32 @@ set -euo pipefail
 posix_line="export PATH=\"\$PATH:$HOME/.foundry/bin\""
 fish_line="fish_add_path -a $HOME/.foundry/bin"
 
-# Deletes every line of file $1 exactly equal to $2, through a temp file.
+# Deletes every line of file $1 exactly equal to $2. Files without the line
+# are left untouched. The result is written back through `cat >` so the
+# file keeps its inode, mode, extended attributes and symlink target.
 strip_line() {
   local file="$1"
   local line="$2"
+  local status=0
+  grep -q -x -F -- "$line" "$file" || status=$?
+  if [ "$status" -eq 1 ]; then
+    return 0
+  fi
+  if [ "$status" -ne 0 ]; then
+    echo "[+] cannot read $file" >&2
+    exit "$status"
+  fi
   local tmp
   tmp="$(mktemp)"
-  grep -v -x -F -- "$line" "$file" > "$tmp" || true
-  mv "$tmp" "$file"
+  status=0
+  grep -v -x -F -- "$line" "$file" > "$tmp" || status=$?
+  if [ "$status" -gt 1 ]; then
+    rm -f "$tmp"
+    echo "[+] cannot filter $file" >&2
+    exit "$status"
+  fi
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
   echo "[+] cleaned $file"
 }
 

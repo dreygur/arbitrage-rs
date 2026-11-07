@@ -1,46 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-import {IWETH, SafeTransfer} from "./V2Leg.sol";
-
-/// @notice Identifies a Uniswap V4 pool; currencies are addresses, zero is native ETH.
-struct PoolKey {
-  /// @notice Lower currency of the pool.
-  address currency0;
-  /// @notice Higher currency of the pool.
-  address currency1;
-  /// @notice LP fee in hundredths of a basis point.
-  uint24 fee;
-  /// @notice Tick spacing of the pool.
-  int24 tickSpacing;
-  /// @notice Hooks contract, zero for hookless pools.
-  address hooks;
-}
-
-/// @notice Parameters of a PoolManager swap.
-struct SwapParams {
-  /// @notice True to sell currency0 for currency1.
-  bool zeroForOne;
-  /// @notice Negative for exact input, positive for exact output.
-  int256 amountSpecified;
-  /// @notice Price the swap may not cross.
-  uint160 sqrtPriceLimitX96;
-}
-
-/// @notice Minimal Uniswap V4 PoolManager surface for flash borrowing and swaps.
-interface IPoolManager {
-  /// @notice Unlocks the manager and calls back `unlockCallback(data)` on the caller.
-  function unlock(bytes calldata data) external returns (bytes memory);
-  /// @notice Sends `amount` of `currency` to `to`, adding a debt to the caller.
-  function take(address currency, address to, uint256 amount) external;
-  /// @notice Credits the caller with what was paid since the last `sync`, or with `msg.value` for native.
-  function settle() external payable returns (uint256 paid);
-  /// @notice Records the manager's balance of `currency` before an ERC20 payment.
-  function sync(address currency) external;
-  /// @notice Swaps in `key`; the result is a BalanceDelta from the caller's point of view,
-  /// amount0 in the high 128 bits, amount1 in the low 128 bits, negative meaning owed.
-  function swap(PoolKey memory key, SwapParams memory params, bytes calldata hookData) external returns (int256 delta);
-}
+import {IPoolManager, IWETH, PoolKey, SwapParams} from "../Interfaces.sol";
+import {SafeTransfer} from "../SafeTransfer.sol";
 
 /// @title Uniswap V4 leg
 /// @notice Swaps exact input inside the executor's unlock and settles both
@@ -52,6 +14,10 @@ library V4Leg {
   uint160 internal constant MAX_PRICE_LIMIT = 1461446703485210103287273052203988822378723970341;
 
   /// @notice Pays `amount` of `currency` that the executor owes the manager.
+  /// @param pm PoolManager, already unlocked by the executor.
+  /// @param currency Currency owed, zero for native ETH (paid by unwrapping WETH).
+  /// @param amount Amount owed.
+  /// @param weth Wrapped native token standing in for native ETH.
   function pay(IPoolManager pm, address currency, uint256 amount, IWETH weth) private {
     if (currency == address(0)) {
       weth.withdraw(amount);
@@ -64,11 +30,24 @@ library V4Leg {
   }
 
   /// @notice Takes `amount` of `currency` due to the executor, wrapping native ETH.
+  /// @param pm PoolManager, already unlocked by the executor.
+  /// @param currency Currency due, zero for native ETH (wrapped into WETH).
+  /// @param amount Amount due.
+  /// @param weth Wrapped native token standing in for native ETH.
   function collect(IPoolManager pm, address currency, uint256 amount, IWETH weth) private {
     pm.take(currency, address(this), amount);
     if (currency == address(0)) {
       weth.deposit{value: amount}();
     }
+  }
+
+  /// @notice Input and output currencies of the leg in `data`, zero meaning native ETH.
+  /// @param data `abi.encode(PoolKey key, bool zeroForOne)`.
+  /// @return currencyIn Currency the leg spends.
+  /// @return currencyOut Currency the leg returns.
+  function currencies(bytes memory data) internal pure returns (address currencyIn, address currencyOut) {
+    (PoolKey memory key, bool zeroForOne) = abi.decode(data, (PoolKey, bool));
+    (currencyIn, currencyOut) = zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
   }
 
   /// @notice Swaps `amountIn` through the pool in `data` and returns the output.

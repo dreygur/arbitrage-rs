@@ -3,8 +3,7 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {FlashArbitrage} from "../FlashArbitrage.sol";
-import {IERC20, IWETH, IUniswapV2Pair} from "../legs/V2Leg.sol";
-import {PoolKey} from "../legs/V4Leg.sol";
+import {IERC20, IWETH, IUniswapV2Pair, PoolKey} from "../Interfaces.sol";
 
 /// @notice Uniswap V2 style factory, used to look up pair addresses.
 interface IUniswapV2Factory {
@@ -191,5 +190,39 @@ contract FlashArbitrageTest is Test {
     vm.prank(OPERATOR);
     vm.expectRevert(abi.encodeWithSelector(FlashArbitrage.NoProfit.selector, 0, 1));
     executor.execute(buy, sell, 1 ether, 1);
+  }
+
+  /// @notice A losing trade on an executor holding no WETH still reports
+  /// `NoProfit`, because the gain is checked before the loan is repaid.
+  function test_no_profit_reverts_without_prior_weth() public {
+    (uint256 wethBefore,,) = executorBalances();
+    assertEq(wethBefore, 0);
+    FlashArbitrage.Leg memory buy = v2Leg(uniPair, true);
+    FlashArbitrage.Leg memory sell = v2Leg(uniPair, false);
+
+    vm.prank(OPERATOR);
+    vm.expectRevert(abi.encodeWithSelector(FlashArbitrage.NoProfit.selector, 0, 7));
+    executor.execute(buy, sell, 1 ether, 7);
+  }
+
+  /// @notice A buy leg that does not spend WETH, or a sell leg that does not
+  /// return it, is refused before anything is borrowed.
+  function test_rejects_bad_leg_currency() public {
+    FlashArbitrage.Leg memory wethToUsdc = v2Leg(uniPair, true);
+    FlashArbitrage.Leg memory usdcToWeth = v2Leg(uniPair, false);
+
+    vm.startPrank(OPERATOR);
+    vm.expectRevert(FlashArbitrage.BadLegCurrency.selector);
+    executor.execute(usdcToWeth, usdcToWeth, 1 ether, 1);
+    vm.expectRevert(FlashArbitrage.BadLegCurrency.selector);
+    executor.execute(wethToUsdc, wethToUsdc, 1 ether, 1);
+    vm.stopPrank();
+  }
+
+  /// @notice Ether from anyone but WETH or the PoolManager is refused.
+  function test_rejects_unexpected_ether() public {
+    vm.deal(address(this), 1 ether);
+    vm.expectRevert(FlashArbitrage.UnexpectedSender.selector);
+    payable(address(executor)).transfer(1 ether);
   }
 }
