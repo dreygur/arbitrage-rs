@@ -18,8 +18,10 @@ pub fn gain(buy: &dyn Venue, sell: &dyn Venue, base: &Id, x: Amount) -> Result<O
     Side::ZeroForOne => token1,
     Side::OneForZero => token0,
   };
+  let sell_side = side_for(sell, other)?;
+  side_for(sell, base)?;
   let bought = buy.quote_out(x, buy_side)?;
-  let back = sell.quote_out(bought, side_for(sell, other)?)?;
+  let back = sell.quote_out(bought, sell_side)?;
   Ok(back.checked_sub(x).filter(|profit| !profit.is_zero()))
 }
 
@@ -76,6 +78,9 @@ pub fn best_amount(
       && best.is_none_or(|(_, top)| profit > top)
     {
       best = Some((x, profit));
+    }
+    if x == hi {
+      break;
     }
     x += one;
   }
@@ -158,6 +163,25 @@ mod tests {
     let want = brute(&buy, &sell, 1_000_000);
     let (_, profit) = best_amount(&buy, &sell, &base(), Amount::from(1_000_000u64)).unwrap();
     assert!(profit + Amount::from(1u64) >= want);
+  }
+
+  /// A sell pool that lacks the base token is rejected.
+  #[test]
+  fn gain_rejects_sell_pool_without_base() {
+    let buy = MockVenue::new("a", "base", "other", 10_000, 25_000, 30);
+    let sell = MockVenue::new("b", "other", "third", 10_000, 20_000, 30);
+    assert!(matches!(
+      gain(&buy, &sell, &base(), Amount::from(100u64)),
+      Err(Error::TokenNotInPool)
+    ));
+  }
+
+  /// The final scan terminates when the search range ends at the maximum amount.
+  #[test]
+  fn scan_does_not_wrap_at_max() {
+    let buy = MockVenue::new("a", "base", "other", 10_000, 25_000, 30);
+    let sell = MockVenue::new("b", "base", "other", 10_000, 20_000, 30);
+    let _ = best_amount(&buy, &sell, &base(), Amount::MAX);
   }
 
   /// The returned size never exceeds the cap.
