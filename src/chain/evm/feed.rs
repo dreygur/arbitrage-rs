@@ -123,6 +123,12 @@ impl FeedHandle {
     Self::new().0
   }
 
+  /// Pools with a refetch queued, for tests.
+  #[cfg(test)]
+  pub(crate) fn queued(&self) -> Vec<Id> {
+    lock(&self.pending).iter().cloned().collect()
+  }
+
   /// Asks for the tick window `request` describes for pool `id`, delivered later as
   /// `FeedEvent::Window`. A pool already waiting for one is not asked for twice.
   pub fn refetch(&self, id: Id, request: WindowRequest) {

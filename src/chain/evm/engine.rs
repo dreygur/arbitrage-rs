@@ -39,10 +39,8 @@ use crate::types::{
   TradeEvent, TradeState, Verdict,
 };
 
-/// Commands buffered before a sender waits for the engine.
-const COMMANDS: usize = 64;
 /// Gas limit of a plain transfer: forwards and cancels.
-const TRANSFER_GAS: u64 = 21_000;
+pub const TRANSFER_GAS: u64 = 21_000;
 /// Gas limit of an owner sweep call, a WETH transfer behind an owner check.
 const SWEEP_GAS: u64 = 100_000;
 /// Error replies (lowercase) by which geth, reth, erigon and anvil say they already hold a
@@ -98,13 +96,19 @@ pub enum EngineCmd {
     /// Gets every op back unchanged with its verdict.
     reply: oneshot::Sender<Vec<(Opportunity, Verdict)>>,
   },
-  /// A new head, and the highest block the bot has applied to its pool state.
-  Block {
+  /// A new head, and the highest block the bot has applied to its pool state. Handled
+  /// without RPC, so a submit right behind it is not held up: it records the block and the
+  /// base fee forecast and frees the locks the applied block allows.
+  Head {
     /// The new block.
     block: FeedBlock,
     /// Highest block number applied to pool state.
     applied: u64,
   },
+  /// The per block work that talks to the node: nonce resyncs, receipts, cancels, balance
+  /// reads, and the sweeps and forwards the holding limits ask for. The chain sends it after
+  /// the head's submit, or before the next head when the bot submitted nothing.
+  Maintain,
   /// An operator command.
   Control(Control),
   /// New live settings.
@@ -388,6 +392,11 @@ pub struct Engine<P> {
   executor_balance: Amount,
   /// Treasury WETH at the last read.
   treasury_balance: Amount,
+  /// Gas limit of a forward to the treasury, above a plain transfer when the treasury has
+  /// code.
+  forward_gas: u64,
+  /// First block at which forwards may go out again after one failed.
+  forwards_paused_until: u64,
 }
 
 impl<P: Provider> Engine<P> {
@@ -443,7 +452,16 @@ impl<P: Provider> Engine<P> {
       next_id: first_id,
       executor_balance: Amount::ZERO,
       treasury_balance: Amount::ZERO,
+      forward_gas: TRANSFER_GAS,
+      forwards_paused_until: 0,
     }
+  }
+
+  /// Sets the gas limit forwards to the treasury are sent with, a plain transfer's 21,000
+  /// unless the chain measured more for a treasury with code.
+  pub fn with_forward_gas(mut self, gas: u64) -> Self {
+    self.forward_gas = gas;
+    self
   }
 
   /// Fee per gas a transaction pays next block, `None` when unknown or over the cap.
@@ -767,11 +785,26 @@ impl<P: Provider> Engine<P> {
   }
 
   /// Forgets finished entries; a mined trade keeps its locks until the bot applied its block.
+  ///
+  /// A forward that reverted or was dropped pauses forwards for the breakers'
+  /// `cooldown_blocks`, so a treasury that refuses transfers costs one failed forward per
+  /// cooldown rather than one per block.
   fn release(&mut self) {
     let applied = self.applied;
-    self
+    let done = |p: &Pending| p.finished() && p.mined_block.is_none_or(|mined| applied >= mined);
+    let failed_forward = self
       .pending
-      .retain(|p| !(p.finished() && p.mined_block.is_none_or(|mined| applied >= mined)));
+      .iter()
+      .any(|p| done(p) && p.kind == EntryKind::Forward && p.state != TradeState::Executed);
+    if failed_forward {
+      let cooldown = self.breakers.cooldown_blocks();
+      self.forwards_paused_until = self.block.saturating_add(cooldown);
+      warn!(
+        until = self.forwards_paused_until,
+        "forward to the treasury failed, forwards paused"
+      );
+    }
+    self.pending.retain(|p| !done(p));
   }
 
   /// The receipt of `tx`, `Ok(None)` while unmined. A failed read is an error, never taken
@@ -1146,7 +1179,13 @@ impl<P: Provider> Engine<P> {
       debug!(from = request.from, kind = ?request.kind, "previous transfer still in progress");
       return false;
     }
-    let gas_limit = if request.data.is_empty() {
+    if request.kind == EntryKind::Forward && self.block < self.forwards_paused_until {
+      debug!(from = request.from, "forwards paused after a failure");
+      return false;
+    }
+    let gas_limit = if request.kind == EntryKind::Forward {
+      self.forward_gas
+    } else if request.data.is_empty() {
       TRANSFER_GAS
     } else {
       SWEEP_GAS
@@ -1188,9 +1227,9 @@ impl<P: Provider> Engine<P> {
     }
   }
 
-  /// Handles a new head: forecasts the base fee, reads receipts, releases locks, cancels
-  /// stuck entries, reads balances and sends the transfers the holding limits ask for.
-  async fn on_block(&mut self, block: FeedBlock, applied: u64) {
+  /// Handles a new head without any RPC: records the block, forecasts the base fee and frees
+  /// the locks the applied block allows.
+  fn on_head(&mut self, block: FeedBlock, applied: u64) {
     self.block = block.number;
     self.applied = self.applied.max(applied);
     self.next_base_fee = Some(next_base_fee(
@@ -1198,12 +1237,19 @@ impl<P: Provider> Engine<P> {
       block.gas_used,
       block.gas_limit,
     ));
+    self.release();
+  }
+
+  /// The per block node work for the current head: resyncs nonces, reads receipts, releases
+  /// locks, cancels stuck entries, reads balances and sends the transfers the holding limits
+  /// ask for.
+  async fn maintain(&mut self) {
     self.sync_lanes().await;
     self.check_receipts().await;
     self.release();
     self.send_cancels().await;
     let fee = self.fee();
-    let Some(balances) = self.read_balances(BlockId::number(block.number)).await else {
+    let Some(balances) = self.read_balances(BlockId::number(self.block)).await else {
       return;
     };
     for request in self.holdings.on_block(&balances, fee.is_some()) {
@@ -1320,7 +1366,8 @@ impl<P: Provider> Engine<P> {
         self.send_planned().await;
         self.release();
       }
-      EngineCmd::Block { block, applied } => self.on_block(block, applied).await,
+      EngineCmd::Head { block, applied } => self.on_head(block, applied),
+      EngineCmd::Maintain => self.maintain().await,
       EngineCmd::Control(command) => self.control(command).await,
       EngineCmd::SetLive(live) => self.set_live(live),
     }
@@ -1328,11 +1375,15 @@ impl<P: Provider> Engine<P> {
 
   /// Starts the engine task: it reads every lane's nonce, then runs commands in order and
   /// publishes after each one. The task ends when every command sender is dropped.
-  pub fn spawn(mut self) -> (mpsc::Sender<EngineCmd>, watch::Receiver<Published>)
+  ///
+  /// The command channel is unbounded so that a sender never waits and commands from the
+  /// bot's synchronous calls (pause, live settings) keep their order; the chain sends a
+  /// bounded number per block, so it grows only while the engine is behind.
+  pub fn spawn(mut self) -> (mpsc::UnboundedSender<EngineCmd>, watch::Receiver<Published>)
   where
     P: 'static,
   {
-    let (commands, mut receiver) = mpsc::channel(COMMANDS);
+    let (commands, mut receiver) = mpsc::unbounded_channel();
     let (published, subscriber) = watch::channel(self.snapshot());
     tokio::spawn(async move {
       self.sync_lanes().await;
@@ -1527,6 +1578,15 @@ mod tests {
       asserter,
       events: events_rx,
       journal: path,
+    }
+  }
+
+  impl<P: Provider> Engine<P> {
+    /// A head followed by its maintenance, as the chain sends them when the bot submits
+    /// nothing.
+    async fn on_block(&mut self, block: FeedBlock, applied: u64) {
+      self.on_head(block, applied);
+      self.maintain().await;
     }
   }
 
@@ -1967,14 +2027,17 @@ mod tests {
     full.base_fee = 20 * GWEI;
     full.gas_used = full.gas_limit;
     commands
-      .send(EngineCmd::Block {
+      .send(EngineCmd::Head {
         block: full,
         applied: 11,
       })
-      .await
       .unwrap();
-    published.changed().await.unwrap();
-    let after = published.borrow_and_update().clone();
+    commands.send(EngineCmd::Maintain).unwrap();
+    let after = published
+      .wait_for(|p| p.status.accounts[1].eth == wei(3 * ETH))
+      .await
+      .unwrap()
+      .clone();
     assert_eq!(after.fee_per_gas, Some(22_500_000_000 + GWEI));
     assert_eq!(after.status.block, 11);
     assert_eq!(after.status.next_base_fee, 22_500_000_000);
@@ -1988,7 +2051,6 @@ mod tests {
         note: SubmitNote::default(),
         reply,
       })
-      .await
       .unwrap();
     assert_eq!(verdicts.await.unwrap(), vec![(op(1, 2, 9), Verdict::Sent)]);
     published.changed().await.unwrap();
@@ -2426,6 +2488,82 @@ mod tests {
     f.engine.on_block(head(15), 15).await;
     assert!(f.engine.pending[0].cancel.is_some());
     assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// A head makes no RPC, so a submit right behind it sends its trade before any receipt or
+  /// balance read; the maintenance that follows reads them afterwards.
+  #[tokio::test]
+  async fn head_then_submit_sends_before_maintenance() {
+    let mut f = fixture("head-submit", 2, 16).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    f.engine
+      .handle(EngineCmd::Head {
+        block: head(11),
+        applied: 11,
+      })
+      .await;
+    assert!(f.asserter.read_q().is_empty());
+    push_sent(&f.asserter);
+    let (reply, verdicts) = oneshot::channel();
+    f.engine
+      .handle(EngineCmd::Submit {
+        ops: vec![op(3, 4, 9)],
+        note: SubmitNote::default(),
+        reply,
+      })
+      .await;
+    assert_eq!(verdicts.await.unwrap()[0].1, Verdict::Sent);
+    assert!(f.asserter.read_q().is_empty(), "submit made extra calls");
+    assert_eq!(f.engine.pending[1].state, TradeState::Sent);
+    push_unmined(&f.asserter);
+    push_unmined(&f.asserter);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.handle(EngineCmd::Maintain).await;
+    assert!(f.asserter.read_q().is_empty(), "maintenance left answers");
+  }
+
+  /// A forward goes out with the gas limit the chain set for the treasury.
+  #[tokio::test]
+  async fn forward_uses_configured_gas() {
+    let mut f = fixture("forward-gas", 2, 16).await;
+    f.engine = f.engine.with_forward_gas(30_000);
+    let forward = TxRequest {
+      from: 1,
+      to: treasury(),
+      value: wei(ETH),
+      data: Bytes::new(),
+      kind: EntryKind::Forward,
+    };
+    assert!(f.engine.queue(forward));
+    assert_eq!(f.engine.pending[0].gas_limit, 30_000);
+  }
+
+  /// A reverted forward pauses forwards for the breakers' cooldown, then they resume.
+  #[tokio::test]
+  async fn failed_forward_pauses_forwards() {
+    let mut f = fixture("forward-pause", 2, 16).await;
+    let forward = TxRequest {
+      from: 1,
+      to: treasury(),
+      value: wei(ETH),
+      data: Bytes::new(),
+      kind: EntryKind::Forward,
+    };
+    assert!(f.engine.queue(forward.clone()));
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    push_mined(&f.asserter, 11, false, 21_000);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(11), 11).await;
+    assert!(f.engine.pending.is_empty());
+    assert_eq!(f.engine.forwards_paused_until, 11 + 5);
+    assert!(!f.engine.queue(forward.clone()));
+    f.engine.block = 15;
+    assert!(!f.engine.queue(forward.clone()));
+    f.engine.block = 16;
+    assert!(f.engine.queue(forward));
   }
 
   /// A forward is refused when its gas cost at the signed fee cap passes `max_gas_cost`,

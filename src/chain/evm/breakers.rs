@@ -43,6 +43,12 @@ impl Breakers {
     }
   }
 
+  /// Blocks a tripped pool stays closed, which the engine also waits out after a failed
+  /// forward.
+  pub fn cooldown_blocks(&self) -> u64 {
+    self.cfg.cooldown_blocks
+  }
+
   /// Drops history that fell out of the window or whose cooldown is over, so memory stays bounded.
   fn prune(&mut self, block: u64) {
     let window = self.cfg.revert_window;

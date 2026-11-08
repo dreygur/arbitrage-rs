@@ -24,13 +24,14 @@ pub mod venue;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, TxKind, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
@@ -39,7 +40,7 @@ use crate::chain::evm::accounts::signers;
 use crate::chain::evm::breakers::Breakers;
 use crate::chain::evm::config::EvmConfig;
 use crate::chain::evm::convert::to_id;
-use crate::chain::evm::engine::{Engine, EngineCmd, Published, SubmitNote, Timing};
+use crate::chain::evm::engine::{Engine, EngineCmd, Published, SubmitNote, TRANSFER_GAS, Timing};
 use crate::chain::evm::executor::ensure_executor;
 use crate::chain::evm::feed::{Feed, FeedBlock, FeedEvent, FeedHandle};
 use crate::chain::evm::gas::{gas_cost, pair_index};
@@ -60,6 +61,8 @@ const WS_URL: &str = "WS_URL";
 const TRADE_EVENTS: usize = 1024;
 /// Pause between attempts of a read that must succeed before the bot may go on.
 const RETRY: Duration = Duration::from_millis(500);
+/// Forward gas headroom over the node's estimate, as `6 / 5` (20%).
+const FORWARD_HEADROOM: (u64, u64) = (6, 5);
 
 /// Reads the env var `name`, treating an unset or empty value as missing.
 fn env_var(name: &str) -> Result<String> {
@@ -146,6 +149,39 @@ async fn has_code(provider: &DynProvider, executor: Address) -> bool {
   }
 }
 
+/// The gas limit forwards to `treasury` are sent with, measured once at connect: a plain
+/// transfer's 21,000 when the treasury has no code; for one with code (a smart wallet, an
+/// EIP 7702 delegation) the node's estimate for a transfer from `from` plus 20%, capped at
+/// `max_gas_limit`. A failed estimate falls back to 21,000, and the engine's pause after a
+/// failed forward keeps that from repeating every block.
+async fn forward_gas(
+  provider: &DynProvider,
+  from: Address,
+  treasury: Address,
+  max_gas_limit: u64,
+) -> Result<u64> {
+  if provider.get_code_at(treasury).await?.is_empty() {
+    return Ok(TRANSFER_GAS);
+  }
+  let request = TransactionRequest {
+    from: Some(from),
+    to: Some(TxKind::Call(treasury)),
+    value: Some(U256::from(1u8)),
+    ..TransactionRequest::default()
+  };
+  match provider.estimate_gas(request).await {
+    Ok(estimate) => {
+      let padded =
+        u128::from(estimate) * u128::from(FORWARD_HEADROOM.0) / u128::from(FORWARD_HEADROOM.1);
+      Ok(u64::try_from(padded).unwrap_or(u64::MAX).min(max_gas_limit))
+    }
+    Err(e) => {
+      warn!(%treasury, error = %e, "forward gas estimate failed, using a plain transfer");
+      Ok(TRANSFER_GAS)
+    }
+  }
+}
+
 /// What only the bot's task touches: pool state and the feed's event stream.
 struct Inner {
   /// The tracked pools.
@@ -170,8 +206,11 @@ pub struct EvmChain {
   snapshots: RwLock<Vec<Arc<dyn Venue>>>,
   /// Asks the feed for tick window refetches; dropping it stops the feed.
   feed: FeedHandle,
-  /// Commands to the engine task.
-  commands: mpsc::Sender<EngineCmd>,
+  /// Commands to the engine task, in the order they must run.
+  commands: mpsc::UnboundedSender<EngineCmd>,
+  /// Set when a head went to the engine and its maintenance has not: it follows the next
+  /// submit, or goes at the start of the next `changes` when the bot submitted nothing.
+  maintenance_due: AtomicBool,
   /// What the engine published last.
   published: watch::Receiver<Published>,
   /// How far the last block read lagged its timestamp.
@@ -237,6 +276,7 @@ impl EvmChain {
       &operators,
     )
     .await?;
+    let forward_gas = forward_gas(&provider, owner.address(), treasury, evm.max_gas_limit).await?;
     let state = State::load(&provider, tracked.clone(), &evm, weth).await?;
     let (addresses, v4_ids) = feed_targets(&tracked, &evm);
     let (feed, events) = Feed::spawn(
@@ -265,7 +305,8 @@ impl EvmChain {
       journal,
       trade_events,
       first_id,
-    );
+    )
+    .with_forward_gas(forward_gas);
     let (commands, published) = engine.spawn();
     let base = to_id(weth);
     let snapshots = state.snapshots();
@@ -284,6 +325,7 @@ impl EvmChain {
       max_fee_per_gas = evm.max_fee_per_gas,
       max_gas_cost = %cfg.live.max_gas_cost,
       max_gas_limit = evm.max_gas_limit,
+      forward_gas,
       first_id,
       "connected"
     );
@@ -296,6 +338,7 @@ impl EvmChain {
       snapshots: RwLock::new(snapshots),
       feed,
       commands,
+      maintenance_due: AtomicBool::new(false),
       published,
       feed_lag_ms: AtomicU64::new(0),
       last_block: Mutex::new(None),
@@ -303,19 +346,17 @@ impl EvmChain {
     Ok((chain, trades))
   }
 
-  /// Sends `command` without waiting; when the engine is behind, a task delivers it later.
+  /// Queues `command` for the engine, behind every command sent before it.
   fn command(&self, command: EngineCmd) {
-    match self.commands.try_send(command) {
-      Ok(()) => {}
-      Err(mpsc::error::TrySendError::Full(command)) => {
-        let commands = self.commands.clone();
-        tokio::spawn(async move {
-          if commands.send(command).await.is_err() {
-            error!("engine stopped, command lost");
-          }
-        });
-      }
-      Err(mpsc::error::TrySendError::Closed(_)) => error!("engine stopped, command lost"),
+    if self.commands.send(command).is_err() {
+      error!("engine stopped, command lost");
+    }
+  }
+
+  /// Sends the held back maintenance for the last head, if any is due.
+  fn maintain(&self) {
+    if self.maintenance_due.swap(false, Ordering::SeqCst) {
+      self.command(EngineCmd::Maintain);
     }
   }
 
@@ -326,15 +367,16 @@ impl EvmChain {
 
   /// Applies `block` to `state`: a change that cannot be trusted reloads every pool, and a
   /// feed gap also checks that the executor still has code, asking for a restart when it is
-  /// gone. Pools near their tick window's edge get a refetch, then the engine hears of the
-  /// block.
+  /// gone. Pools near their tick window's edge get a refetch, then the engine gets the head,
+  /// which it handles without RPC; its maintenance is held back until after the submit.
+  ///
+  /// The block counts as read once state reflects it, so a reload's time is in the read
+  /// stage of a trade's latency rather than in the decision.
   async fn on_block(&self, state: &mut State, block: FeedBlock) -> Result<Update> {
-    let read = Instant::now();
     self.feed_lag_ms.store(
       lag_ms(block.timestamp, SystemTime::now()),
       Ordering::Relaxed,
     );
-    *lock(&self.last_block) = Some((block.seen, read));
     let mut update = state.apply(&block);
     if update.reload {
       reload(&self.provider, state).await;
@@ -343,6 +385,7 @@ impl EvmChain {
         update.restart = true;
       }
     }
+    *lock(&self.last_block) = Some((block.seen, Instant::now()));
     for (id, request) in state.near_edge() {
       self.feed.refetch(id, request);
     }
@@ -350,9 +393,9 @@ impl EvmChain {
     let applied = state.block();
     self
       .commands
-      .send(EngineCmd::Block { block, applied })
-      .await
+      .send(EngineCmd::Head { block, applied })
       .map_err(|_| Error::Rpc("engine stopped".into()))?;
+    self.maintenance_due.store(true, Ordering::SeqCst);
     Ok(update)
   }
 }
@@ -360,8 +403,10 @@ impl EvmChain {
 impl Chain for EvmChain {
   /// Waits for the next feed event and applies it: a tick window changes no quote inside
   /// the old window and yields an empty update; a block is applied as [`EvmChain::on_block`]
-  /// describes.
+  /// describes. Maintenance still due for the last head, because the bot submitted nothing,
+  /// goes first so the engine works on it while this call waits.
   async fn changes(&self) -> Result<Update> {
+    self.maintain();
     let mut inner = self.inner.lock().await;
     let Some(event) = inner.events.recv().await else {
       return Err(Error::Rpc("feed stopped".into()));
@@ -399,8 +444,9 @@ impl Chain for EvmChain {
     Some(gas_cost(limit, fee))
   }
 
-  /// Hands the batch to the engine with its pools' descriptions and the block's timing, and
-  /// waits for the verdicts; a stopped engine yields none, which the bot reports.
+  /// Hands the batch to the engine with its pools' descriptions and the block's timing, queues
+  /// the head's held back maintenance behind it, and waits for the verdicts; a stopped engine
+  /// yields none, which the bot reports.
   async fn submit(&self, ops: Vec<Opportunity>) -> Vec<(Opportunity, Verdict)> {
     let decided = Instant::now();
     let pools: HashSet<&Id> = ops
@@ -424,10 +470,11 @@ impl Chain for EvmChain {
       note: SubmitNote { describe, timing },
       reply,
     };
-    if self.commands.send(command).await.is_err() {
+    if self.commands.send(command).is_err() {
       error!("engine stopped, trades not submitted");
       return Vec::new();
     }
+    self.maintain();
     answer.await.unwrap_or_else(|_| {
       error!("engine dropped a submit without verdicts");
       Vec::new()
@@ -532,21 +579,27 @@ mod tests {
     /// Feeds events to `changes`.
     feed: mpsc::Sender<FeedEvent>,
     /// What the chain asked of the engine.
-    commands: mpsc::Receiver<EngineCmd>,
+    commands: mpsc::UnboundedReceiver<EngineCmd>,
     /// Stands in for the engine's publishing side.
     published: watch::Sender<Published>,
   }
 
-  /// A harness whose chain knows the pools in `legs`.
-  async fn harness(legs: HashMap<Id, LegSpec>) -> Harness {
+  /// A harness whose chain knows the pools in `legs` and tracks `tracked`, loaded from the
+  /// answers `load` queues.
+  async fn harness_with(
+    legs: HashMap<Id, LegSpec>,
+    tracked: Vec<Tracked>,
+    load: impl FnOnce(&Asserter),
+  ) -> Harness {
     let asserter = Asserter::new();
     let provider = mock_provider(&asserter).erased();
-    asserter.push_success(&U64::from(LOADED));
-    let state = State::load(&provider, Vec::new(), &mock_evm_config(), weth())
+    load(&asserter);
+    let state = State::load(&provider, tracked, &mock_evm_config(), weth())
       .await
       .unwrap();
+    assert!(asserter.read_q().is_empty(), "load left answers unread");
     let (feed, events) = mpsc::channel(8);
-    let (commands_tx, commands) = mpsc::channel(8);
+    let (commands_tx, commands) = mpsc::unbounded_channel();
     let (published, published_rx) = watch::channel(published(Some(GWEI)));
     let chain = EvmChain {
       provider,
@@ -557,6 +610,7 @@ mod tests {
       snapshots: RwLock::new(Vec::new()),
       feed: FeedHandle::detached(),
       commands: commands_tx,
+      maintenance_due: AtomicBool::new(false),
       published: published_rx,
       feed_lag_ms: AtomicU64::new(0),
       last_block: Mutex::new(None),
@@ -568,6 +622,27 @@ mod tests {
       commands,
       published,
     }
+  }
+
+  /// A harness over no pools loaded at block 10, whose chain knows the pools in `legs`.
+  async fn harness(legs: HashMap<Id, LegSpec>) -> Harness {
+    harness_with(legs, Vec::new(), |asserter| {
+      asserter.push_success(&U64::from(LOADED))
+    })
+    .await
+  }
+
+  /// The names of the commands queued for the engine so far, in order.
+  fn sent(commands: &mut mpsc::UnboundedReceiver<EngineCmd>) -> Vec<&'static str> {
+    std::iter::from_fn(|| commands.try_recv().ok())
+      .map(|command| match command {
+        EngineCmd::Submit { .. } => "submit",
+        EngineCmd::Head { .. } => "head",
+        EngineCmd::Maintain => "maintain",
+        EngineCmd::Control(_) => "control",
+        EngineCmd::SetLive(_) => "live",
+      })
+      .collect()
   }
 
   /// A block at `number` with no logs, stamped at the epoch, flagged as a gap when `gap`.
@@ -586,10 +661,10 @@ mod tests {
   }
 
   /// The highest applied block the chain reported to the engine with its next command.
-  fn applied(commands: &mut mpsc::Receiver<EngineCmd>) -> u64 {
+  fn applied(commands: &mut mpsc::UnboundedReceiver<EngineCmd>) -> u64 {
     match commands.try_recv() {
-      Ok(EngineCmd::Block { applied, .. }) => applied,
-      other => panic!("expected a block command, got {other:?}"),
+      Ok(EngineCmd::Head { applied, .. }) => applied,
+      other => panic!("expected a head command, got {other:?}"),
     }
   }
 
@@ -723,6 +798,141 @@ mod tests {
     };
     let (verdicts, ()) = tokio::join!(h.chain.submit(vec![op.clone()]), engine);
     assert_eq!(verdicts, vec![(op, Verdict::Sent)]);
+    assert_eq!(sent(&mut h.commands), vec!["maintain"]);
+  }
+
+  /// A head reaches the engine before the submit it drives, and its maintenance only after
+  /// that submit, so no node work sits between the decision and the send.
+  #[tokio::test]
+  async fn maintenance_follows_submit() {
+    let mut h = harness(HashMap::new()).await;
+    h.feed
+      .send(FeedEvent::Block(block(LOADED + 1, false)))
+      .await
+      .unwrap();
+    h.chain.changes().await.unwrap();
+    let engine = async {
+      match h.commands.recv().await {
+        Some(EngineCmd::Head { .. }) => {}
+        other => panic!("expected the head first, got {other:?}"),
+      }
+      let Some(EngineCmd::Submit { ops, reply, .. }) = h.commands.recv().await else {
+        panic!("expected the submit second");
+      };
+      reply
+        .send(ops.into_iter().map(|op| (op, Verdict::Sent)).collect())
+        .unwrap();
+    };
+    let op = Opportunity {
+      buy_pool: Id::new(b"a".to_vec()),
+      sell_pool: Id::new(b"b".to_vec()),
+      token: Id::new(b"x".to_vec()),
+      amount: Amount::from(1u64),
+      profit: Amount::from(1u64),
+      floor: Amount::ZERO,
+    };
+    tokio::join!(h.chain.submit(vec![op]), engine);
+    assert_eq!(sent(&mut h.commands), vec!["maintain"]);
+    h.chain.control(Control::Pause);
+    assert_eq!(sent(&mut h.commands), vec!["control"]);
+  }
+
+  /// Without a submit, the head's maintenance goes at the start of the next `changes`,
+  /// before the next head, and only once.
+  #[tokio::test]
+  async fn maintenance_sent_by_next_changes_without_submit() {
+    let mut h = harness(HashMap::new()).await;
+    for number in [LOADED + 1, LOADED + 2] {
+      h.feed
+        .send(FeedEvent::Block(block(number, false)))
+        .await
+        .unwrap();
+      h.chain.changes().await.unwrap();
+    }
+    assert_eq!(sent(&mut h.commands), vec!["head", "maintain", "head"]);
+  }
+
+  /// A reload without a gap, from a skipped block, rereads the pools but never the
+  /// executor's code.
+  #[tokio::test(start_paused = true)]
+  async fn reload_without_gap_skips_code_read() {
+    let mut h = harness(HashMap::new()).await;
+    h.asserter.push_success(&U64::from(LOADED + 2));
+    h.feed
+      .send(FeedEvent::Block(block(LOADED + 2, false)))
+      .await
+      .unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), h.chain.changes())
+      .await
+      .expect("changes waited on a code read")
+      .unwrap();
+    assert!(update.reload && !update.restart, "{update:?}");
+    assert!(h.asserter.read_q().is_empty());
+    assert_eq!(applied(&mut h.commands), LOADED + 2);
+  }
+
+  /// A V4 pool whose block moves it near its tick window's edge gets a refetch.
+  #[tokio::test]
+  async fn near_edge_pool_refetched() {
+    use crate::chain::evm::state::tests as fixture;
+    let h = harness_with(HashMap::new(), fixture::tracked(), |asserter| {
+      fixture::push_load(asserter, fixture::GOOD)
+    })
+    .await;
+    let mut head = block(LOADED + 1, false);
+    head.logs = vec![fixture::swap(
+      fixture::manager(),
+      fixture::key().pool_id(),
+      fixture::L,
+      fixture::NEAR_UPPER,
+    )];
+    h.feed.send(FeedEvent::Block(head)).await.unwrap();
+    let update = h.chain.changes().await.unwrap();
+    assert_eq!(update.touched, HashSet::from([fixture::v4_id()]));
+    assert_eq!(h.chain.feed.queued(), vec![fixture::v4_id()]);
+  }
+
+  /// A treasury without code takes a plain transfer's gas with no estimate; one with code
+  /// gets the estimate plus 20%, capped at `max_gas_limit`, and 21,000 when the estimate
+  /// fails.
+  #[tokio::test]
+  async fn forward_gas_from_treasury_code() {
+    let asserter = Asserter::new();
+    let provider = mock_provider(&asserter).erased();
+    let (from, treasury) = (Address::repeat_byte(1), Address::repeat_byte(9));
+    let code = Bytes::from(vec![0xef, 0x01, 0x00]);
+    asserter.push_success(&Bytes::new());
+    assert_eq!(
+      forward_gas(&provider, from, treasury, 1_000_000)
+        .await
+        .unwrap(),
+      TRANSFER_GAS
+    );
+    asserter.push_success(&code);
+    asserter.push_success(&U64::from(50_000));
+    assert_eq!(
+      forward_gas(&provider, from, treasury, 1_000_000)
+        .await
+        .unwrap(),
+      60_000
+    );
+    asserter.push_success(&code);
+    asserter.push_success(&U64::from(900_000));
+    assert_eq!(
+      forward_gas(&provider, from, treasury, 1_000_000)
+        .await
+        .unwrap(),
+      1_000_000
+    );
+    asserter.push_success(&code);
+    asserter.push_failure_msg("execution reverted");
+    assert_eq!(
+      forward_gas(&provider, from, treasury, 1_000_000)
+        .await
+        .unwrap(),
+      TRANSFER_GAS
+    );
+    assert!(asserter.read_q().is_empty());
   }
 
   /// Ledger ids continue one past the journal's highest, starting at 1 without a journal.

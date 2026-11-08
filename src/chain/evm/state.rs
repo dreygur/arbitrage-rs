@@ -475,7 +475,7 @@ impl State {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
   use super::*;
   use std::collections::HashSet;
 
@@ -489,13 +489,13 @@ mod tests {
   use crate::testkit::{mock_evm_config, mock_provider, push_multicall};
 
   /// Liquidity of the V4 test pool's one position.
-  const L: u128 = 10_000_000_000;
+  pub(crate) const L: u128 = 10_000_000_000;
   /// Block the test state is loaded at.
   const LOADED: u64 = 10;
   /// A tick within one word of the upper edge of the window loaded around tick zero.
-  const NEAR_UPPER: i32 = 16_000;
+  pub(crate) const NEAR_UPPER: i32 = 16_000;
   /// Answers of a load where every pool reads cleanly at block 10.
-  const GOOD: Answers = Answers {
+  pub(crate) const GOOD: Answers = Answers {
     block: LOADED,
     protocol_fee: 0,
     reserves: true,
@@ -504,7 +504,7 @@ mod tests {
 
   /// How the mocked node answers one load.
   #[derive(Clone, Copy)]
-  struct Answers {
+  pub(crate) struct Answers {
     /// Latest block number.
     block: u64,
     /// The V4 pool's protocol fee.
@@ -531,7 +531,7 @@ mod tests {
   }
 
   /// Key of the native ETH / token V4 pool at fee 3000, spacing 60.
-  fn key() -> V4Key {
+  pub(crate) fn key() -> V4Key {
     V4Key {
       currency0: Address::ZERO,
       currency1: token(),
@@ -542,12 +542,12 @@ mod tests {
   }
 
   /// Core id of the V4 pool.
-  fn v4_id() -> Id {
+  pub(crate) fn v4_id() -> Id {
     Id::new(key().pool_id().to_vec())
   }
 
   /// The V2 pair and the V4 pool, as discovery would return them.
-  fn tracked() -> Vec<Tracked> {
+  pub(crate) fn tracked() -> Vec<Tracked> {
     vec![
       Tracked::V2 {
         venue: 0,
@@ -570,7 +570,7 @@ mod tests {
 
   /// Queues the answers a load reads, shaped by `answers`: block number, the pool batch, and
   /// the tick window batches (one position over -600..600) unless the V4 pool is skipped.
-  fn push_load(asserter: &Asserter, answers: Answers) {
+  pub(crate) fn push_load(asserter: &Asserter, answers: Answers) {
     asserter.push_success(&U64::from(answers.block));
     let protocol_fee = answers.protocol_fee;
     let reserves = IUniswapV2Pair::getReservesReturn {
@@ -680,7 +680,7 @@ mod tests {
   }
 
   /// A PoolManager `Swap` log for `id` leaving the pool at `tick` with `liquidity`.
-  fn swap(from: Address, id: B256, liquidity: u128, tick: i32) -> Log {
+  pub(crate) fn swap(from: Address, id: B256, liquidity: u128, tick: i32) -> Log {
     let event = IPoolManager::Swap {
       id,
       sender: Address::ZERO,
@@ -695,7 +695,7 @@ mod tests {
   }
 
   /// The PoolManager address of the V4 venue.
-  fn manager() -> Address {
+  pub(crate) fn manager() -> Address {
     mock_evm_config().venues[1].address
   }
 
