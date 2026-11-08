@@ -1,5 +1,6 @@
 //! EVM adapter, the only place that imports alloy.
 
+pub mod accounts;
 pub mod bindings;
 pub mod breakers;
 pub mod config;
