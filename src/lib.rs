@@ -5,6 +5,7 @@ pub mod chain;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod journal;
 pub mod sizing;
 pub mod strategy;
 #[cfg(any(test, feature = "testkit"))]
