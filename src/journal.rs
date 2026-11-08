@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::types::TradeEvent;
 
 /// Capacity of the channel between the engine and the writer task.
@@ -141,32 +141,30 @@ impl Journal {
   }
 }
 
-/// Reads the journal and returns its last `n` entries in file order.
+/// Reads the journal and returns its last `n` entries in file order, plus
+/// the number of malformed lines skipped.
 ///
-/// A malformed line is an error naming its line number, except a final line
-/// without a trailing newline, which a crash may have torn and is skipped.
+/// A crash can tear a line, so every malformed line is skipped with a
+/// warning naming its line number instead of making the journal unreadable.
 // Reads the whole file: a journal holds a handful of lines per trade, so it stays small.
-pub async fn read_last(path: &Path, n: usize) -> Result<Vec<JournalEntry>> {
+pub async fn read_last(path: &Path, n: usize) -> Result<(Vec<JournalEntry>, usize)> {
   let text = tokio::fs::read_to_string(path).await?;
-  let unterminated = !text.ends_with('\n');
-  let total = text.lines().count();
   let mut entries = Vec::new();
+  let mut skipped = 0;
   for (index, line) in text.lines().enumerate() {
     if line.trim().is_empty() {
       continue;
     }
     match serde_json::from_str(line) {
       Ok(entry) => entries.push(entry),
-      Err(e) if unterminated && index + 1 == total => {
-        warn!(line = index + 1, error = %e, "skipping torn final journal line");
-      }
       Err(e) => {
-        return Err(Error::Config(format!("journal line {}: {e}", index + 1)));
+        skipped += 1;
+        warn!(line = index + 1, error = %e, "skipping malformed journal line");
       }
     }
   }
   let start = entries.len().saturating_sub(n);
-  Ok(entries.split_off(start))
+  Ok((entries.split_off(start), skipped))
 }
 
 #[cfg(test)]
@@ -249,6 +247,7 @@ mod tests {
     let ids: Vec<u64> = read_last(&path, 10)
       .await
       .unwrap()
+      .0
       .iter()
       .map(|e| e.event.id)
       .collect();
@@ -262,10 +261,10 @@ mod tests {
     let tx = Journal::spawn(&path).await.unwrap();
     tx.record(event(1)).await;
     wait_for_lines(&path, 1).await;
-    assert_eq!(read_last(&path, 5).await.unwrap().len(), 1);
+    assert_eq!(read_last(&path, 5).await.unwrap().0.len(), 1);
   }
 
-  /// The tail comes back in file order and a bad line names its number.
+  /// The tail comes back in file order with nothing skipped.
   #[tokio::test]
   async fn read_last_returns_tail_in_order() {
     let path = temp_path("tail", "trades.jsonl");
@@ -274,18 +273,10 @@ mod tests {
       tx.record(event(id)).await;
     }
     wait_for_lines(&path, 5).await;
-    let ids: Vec<u64> = read_last(&path, 3)
-      .await
-      .unwrap()
-      .iter()
-      .map(|e| e.event.id)
-      .collect();
+    let (entries, skipped) = read_last(&path, 3).await.unwrap();
+    let ids: Vec<u64> = entries.iter().map(|e| e.event.id).collect();
     assert_eq!(ids, vec![3, 4, 5]);
-    let mut text = tokio::fs::read_to_string(&path).await.unwrap();
-    text.push_str("not json\n");
-    tokio::fs::write(&path, text).await.unwrap();
-    let err = read_last(&path, 3).await.unwrap_err();
-    assert!(err.to_string().contains("line 6"));
+    assert_eq!(skipped, 0);
   }
 
   /// A torn last line gets a newline on spawn so the next entry stands alone.
@@ -314,9 +305,9 @@ mod tests {
     );
   }
 
-  /// A malformed final line without a newline is skipped, interior ones error.
+  /// Malformed lines, torn or interior, are skipped and counted.
   #[tokio::test]
-  async fn read_last_skips_torn_final_line() {
+  async fn read_last_skips_malformed_lines() {
     let path = temp_path("torn-read", "trades.jsonl");
     let tx = Journal::spawn(&path).await.unwrap();
     tx.record(event(1)).await;
@@ -324,11 +315,32 @@ mod tests {
     let mut text = tokio::fs::read_to_string(&path).await.unwrap();
     text.push_str("{\"ts\":\"torn");
     tokio::fs::write(&path, &text).await.unwrap();
-    let entries = read_last(&path, 5).await.unwrap();
-    assert_eq!(entries.len(), 1);
-    text.push('\n');
+    let (entries, skipped) = read_last(&path, 5).await.unwrap();
+    assert_eq!((entries.len(), skipped), (1, 1));
+    text.push_str("\nnot json\n");
     tokio::fs::write(&path, &text).await.unwrap();
-    let err = read_last(&path, 5).await.unwrap_err();
-    assert!(err.to_string().contains("line 2"));
+    let (entries, skipped) = read_last(&path, 5).await.unwrap();
+    assert_eq!((entries.len(), skipped), (1, 2));
+  }
+
+  /// A torn line terminated by spawn and followed by good entries reads back
+  /// the good ones with one line skipped.
+  #[tokio::test]
+  async fn reads_good_entries_after_terminated_torn_line() {
+    let path = temp_path("torn-then-good", "trades.jsonl");
+    tokio::fs::create_dir_all(path.parent().unwrap())
+      .await
+      .unwrap();
+    tokio::fs::write(&path, "{\"ts\":\"2026-11-08T00:00:00Z\",\"eve")
+      .await
+      .unwrap();
+    let tx = Journal::spawn(&path).await.unwrap();
+    tx.record(event(1)).await;
+    tx.record(event(2)).await;
+    wait_for_lines(&path, 3).await;
+    let (entries, skipped) = read_last(&path, 10).await.unwrap();
+    let ids: Vec<u64> = entries.iter().map(|e| e.event.id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(skipped, 1);
   }
 }

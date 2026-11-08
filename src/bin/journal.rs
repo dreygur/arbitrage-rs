@@ -33,7 +33,10 @@ async fn main() -> eyre::Result<()> {
   dotenvy::dotenv().ok();
   let network = std::env::var("NETWORK").unwrap_or_else(|_| "ethereum".into());
   let config = NetworkConfig::load(&network)?;
-  let entries = read_last(&config.journal, ENTRIES).await?;
+  let (entries, skipped) = read_last(&config.journal, ENTRIES).await?;
+  if skipped > 0 {
+    println!("skipped {skipped} malformed lines");
+  }
   println!(
     "{:<20} {:<7} {:<9} {:<27} {:<14} {:<14} {:<24} gas used",
     "time", "kind", "state", "pair", "account", "tx", "profit"
