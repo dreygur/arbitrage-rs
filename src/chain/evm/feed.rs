@@ -17,11 +17,11 @@ use alloy::sol_types::SolEvent;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::chain::evm::bindings::{IPoolManager, IUniswapV2Pair};
-use crate::chain::evm::ticks::{BoundedTicks, fetch_window};
-use crate::chain::evm::venue::v4::V4Key;
+use crate::chain::evm::ticks::{BoundedTicks, WindowRequest, fetch_window};
 use crate::error::Result;
 use crate::types::Id;
 
@@ -29,6 +29,8 @@ use crate::types::Id;
 const EVENTS: usize = 64;
 /// Pause before reconnecting a dropped or failed WebSocket.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// Longest a log fetch or a tick window refetch may take before it is given up.
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One block's header values and the tracked pools' logs in it.
 #[derive(Clone, Debug)]
@@ -45,8 +47,8 @@ pub struct FeedBlock {
   pub gas_limit: u64,
   /// Logs of tracked pools, as the node returned them.
   pub logs: Vec<Log>,
-  /// Whether blocks may have been missed (a reconnect, or a number that does not follow the
-  /// last one), so state must be reloaded.
+  /// Whether blocks may have been missed or replaced (a reconnect, a number that does not
+  /// follow the last one, or a parent that is not the last block), so state must be reloaded.
   pub gap: bool,
 }
 
@@ -55,18 +57,16 @@ pub struct FeedBlock {
 pub enum FeedEvent {
   /// A new block.
   Block(FeedBlock),
-  /// A refetched tick window for the V4 pool with this id.
-  Window(Id, BoundedTicks),
+  /// A refetched tick window for the V4 pool with this id, read at this block number.
+  Window(Id, u64, BoundedTicks),
 }
 
 /// A tick window refetch the bot asked for.
 struct Refetch {
   /// Core id of the pool.
   id: Id,
-  /// The pool key.
-  key: V4Key,
-  /// Tick to center the window on.
-  tick: i32,
+  /// The window to read.
+  request: WindowRequest,
 }
 
 /// Locks the set of pools with a refetch queued, recovering it if a holder panicked.
@@ -74,10 +74,12 @@ fn lock(pending: &Mutex<HashSet<Id>>) -> MutexGuard<'_, HashSet<Id>> {
   pending.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether block `number` does not directly follow `last`: a skipped, repeated or earlier
-/// number means a missed block, a reorg or a refork. The first block is never a gap.
-pub fn is_gap(last: Option<u64>, number: u64) -> bool {
-  last.is_some_and(|last| last.checked_add(1) != Some(number))
+/// Whether the block `number` with parent `parent` does not directly extend `last` (the
+/// number and hash of the last block delivered): a skipped, repeated or earlier number, or a
+/// parent other than the last hash, means a missed block, a reorg or a refork. The first block
+/// is never a gap.
+pub fn is_gap(last: Option<(u64, B256)>, number: u64, parent: B256) -> bool {
+  last.is_some_and(|(last, hash)| last.checked_add(1) != Some(number) || parent != hash)
 }
 
 /// Whether `log` is a tracked pool's: any `Sync` (the filter already limits addresses), or a
@@ -111,13 +113,13 @@ impl FeedHandle {
     (handle, receiver)
   }
 
-  /// Asks for the tick window of pool `id` around `tick`, delivered later as
+  /// Asks for the tick window `request` describes for pool `id`, delivered later as
   /// `FeedEvent::Window`. A pool already waiting for one is not asked for twice.
-  pub fn refetch(&self, id: Id, key: V4Key, tick: i32) {
+  pub fn refetch(&self, id: Id, request: WindowRequest) {
     if !lock(&self.pending).insert(id.clone()) {
       return;
     }
-    if self.requests.send(Refetch { id, key, tick }).is_err() {
+    if self.requests.send(Refetch { id, request }).is_err() {
       warn!("feed stopped, refetch dropped");
     }
   }
@@ -144,18 +146,14 @@ pub struct Feed<P> {
   multicall: Address,
   /// StateView address for tick window reads.
   state_view: Address,
-  /// Bitmap words fetched each side of the current word.
-  tick_words: u16,
   /// Events to the bot.
   events: mpsc::Sender<FeedEvent>,
   /// Refetch requests from the bot.
   requests: mpsc::UnboundedReceiver<Refetch>,
   /// Pools with a refetch queued or running, shared with the handle.
   pending: Arc<Mutex<HashSet<Id>>>,
-  /// Number of the last block delivered.
-  last: Option<u64>,
-  /// Hash of the last block delivered, the block refetches are pinned to.
-  last_hash: Option<B256>,
+  /// Number and hash of the last block delivered; refetches are pinned to it.
+  last: Option<(u64, B256)>,
   /// Whether the WebSocket reconnected since the last block delivered.
   reconnected: bool,
 }
@@ -163,8 +161,8 @@ pub struct Feed<P> {
 impl<P: Provider + Send + Sync + 'static> Feed<P> {
   /// Fetches the tracked logs of the block `header` names and delivers it.
   ///
-  /// A failed fetch skips the block; the next one then counts as a gap. Returns false once
-  /// the bot is gone.
+  /// A failed or timed out fetch skips the block; the next one then counts as a gap. Returns
+  /// false once the bot is gone.
   async fn on_head(&mut self, header: Header) -> bool {
     let number = header.inner.number;
     let hash = header.hash;
@@ -176,10 +174,14 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
         IPoolManager::ModifyLiquidity::SIGNATURE_HASH,
       ])
       .at_block_hash(hash);
-    let logs = match self.provider.get_logs(&filter).await {
-      Ok(logs) => logs,
-      Err(e) => {
+    let logs = match timeout(RPC_TIMEOUT, self.provider.get_logs(&filter)).await {
+      Ok(Ok(logs)) => logs,
+      Ok(Err(e)) => {
         warn!(block = number, error = %e, "logs unavailable, skipping block");
+        return true;
+      }
+      Err(_) => {
+        warn!(block = number, "logs timed out, skipping block");
         return true;
       }
     };
@@ -197,42 +199,50 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
         .into_iter()
         .filter(|log| wanted(log, &self.v4_ids))
         .collect(),
-      gap: self.reconnected || is_gap(self.last, number),
+      gap: self.reconnected || is_gap(self.last, number, header.inner.parent_hash),
     };
     if self.events.send(FeedEvent::Block(block)).await.is_err() {
       return false;
     }
     self.reconnected = false;
-    self.last = Some(number);
-    self.last_hash = Some(hash);
+    self.last = Some((number, hash));
     true
   }
 
   /// Fetches the requested tick window at the last delivered block and delivers it.
   ///
-  /// A failed fetch is dropped with a warning; the bot asks again while the pool stays near
-  /// its edge. Returns false once the bot is gone.
-  async fn on_refetch(&mut self, request: Refetch) -> bool {
-    let fetched = match self.last_hash {
-      Some(hash) => fetch_window(
-        &self.provider,
-        self.multicall,
-        self.state_view,
-        BlockId::hash(hash),
-        &request.key,
-        request.tick,
-        self.tick_words,
-      )
-      .await
-      .map_err(|e| warn!(pool = %request.id, error = %e, "tick window refetch failed"))
-      .ok(),
+  /// A failed or timed out fetch is dropped with a warning; the bot asks again while the pool
+  /// stays near its edge. Returns false once the bot is gone.
+  async fn on_refetch(&mut self, refetch: Refetch) -> bool {
+    let id = refetch.id;
+    let fetched = match self.last {
+      Some((number, hash)) => {
+        let read = fetch_window(
+          &self.provider,
+          self.multicall,
+          self.state_view,
+          BlockId::hash(hash),
+          refetch.request,
+        );
+        match timeout(RPC_TIMEOUT, read).await {
+          Ok(Ok(ticks)) => Some((number, ticks)),
+          Ok(Err(e)) => {
+            warn!(pool = %id, error = %e, "tick window refetch failed");
+            None
+          }
+          Err(_) => {
+            warn!(pool = %id, "tick window refetch timed out");
+            None
+          }
+        }
+      }
       None => None,
     };
-    lock(&self.pending).remove(&request.id);
+    lock(&self.pending).remove(&id);
     match fetched {
-      Some(ticks) => self
+      Some((number, ticks)) => self
         .events
-        .send(FeedEvent::Window(request.id, ticks))
+        .send(FeedEvent::Window(id, number, ticks))
         .await
         .is_ok(),
       None => true,
@@ -240,6 +250,8 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
   }
 
   /// Follows one WebSocket connection until it drops. Returns false once the bot is gone.
+  ///
+  /// Heads go first: a waiting head is handled before any queued refetch.
   async fn session(&mut self, ws_url: &str) -> Result<bool> {
     let ws = ProviderBuilder::new()
       .connect_ws(WsConnect::new(ws_url))
@@ -247,6 +259,7 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
     let mut heads = ws.subscribe_blocks().await?.into_stream();
     loop {
       tokio::select! {
+        biased;
         head = heads.next() => match head {
           Some(header) => {
             if !self.on_head(header).await {
@@ -255,8 +268,8 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
           }
           None => return Ok(true),
         },
-        Some(request) = self.requests.recv() => {
-          if !self.on_refetch(request).await {
+        Some(refetch) = self.requests.recv() => {
+          if !self.on_refetch(refetch).await {
             return Ok(false);
           }
         }
@@ -281,7 +294,7 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
   /// Starts the feed task over `ws_url` and returns its handle and event stream.
   ///
   /// `addresses` are the tracked pairs and the PoolManager; `v4_ids` the tracked V4 pools;
-  /// `multicall`, `state_view` and `tick_words` are what tick window refetches read with.
+  /// `multicall` and `state_view` are what tick window refetches read through.
   pub fn spawn(
     ws_url: String,
     provider: P,
@@ -289,7 +302,6 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
     v4_ids: HashSet<B256>,
     multicall: Address,
     state_view: Address,
-    tick_words: u16,
   ) -> (FeedHandle, mpsc::Receiver<FeedEvent>) {
     let (mut handle, requests) = FeedHandle::new();
     let (events, receiver) = mpsc::channel(EVENTS);
@@ -299,12 +311,10 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
       v4_ids,
       multicall,
       state_view,
-      tick_words,
       events,
       requests,
       pending: handle.pending.clone(),
       last: None,
-      last_hash: None,
       reconnected: false,
     };
     handle.task = Some(tokio::spawn(feed.run(ws_url)));
@@ -318,6 +328,8 @@ mod tests {
 
   use alloy::primitives::LogData;
 
+  use crate::chain::evm::venue::v4::V4Key;
+
   /// A PoolManager log with `topics` and no data.
   fn log(topics: Vec<B256>) -> Log {
     Log {
@@ -329,15 +341,25 @@ mod tests {
     }
   }
 
-  /// Only a number that follows the last one directly is not a gap.
+  /// Only a block that follows the last one by number and by parent hash is not a gap.
   #[test]
   fn gap_detected_on_skip_repeat_or_rewind() {
-    assert!(!is_gap(None, 7));
-    assert!(!is_gap(Some(7), 8));
-    assert!(is_gap(Some(7), 9));
-    assert!(is_gap(Some(7), 7));
-    assert!(is_gap(Some(7), 3));
-    assert!(is_gap(Some(u64::MAX), 0));
+    let hash = B256::repeat_byte(7);
+    let last = Some((7, hash));
+    assert!(!is_gap(None, 7, B256::ZERO));
+    assert!(!is_gap(last, 8, hash));
+    assert!(is_gap(last, 9, hash));
+    assert!(is_gap(last, 7, hash));
+    assert!(is_gap(last, 3, hash));
+    assert!(is_gap(Some((u64::MAX, hash)), 0, hash));
+  }
+
+  /// A block whose parent is not the last block delivered is a reorg, even with the next
+  /// number.
+  #[test]
+  fn gap_detected_on_parent_mismatch() {
+    let last = Some((7, B256::repeat_byte(7)));
+    assert!(is_gap(last, 8, B256::repeat_byte(8)));
   }
 
   /// `Sync` logs pass; PoolManager logs pass only for tracked pool ids.
@@ -369,12 +391,17 @@ mod tests {
       hooks: Address::ZERO,
     };
     let id = Id::new(key.pool_id().to_vec());
-    handle.refetch(id.clone(), key, 100);
-    handle.refetch(id.clone(), key, 200);
-    assert_eq!(requests.try_recv().unwrap().tick, 100);
+    let at = |tick| WindowRequest {
+      key,
+      tick,
+      words: 2,
+    };
+    handle.refetch(id.clone(), at(100));
+    handle.refetch(id.clone(), at(200));
+    assert_eq!(requests.try_recv().unwrap().request, at(100));
     assert!(requests.try_recv().is_err());
     lock(&handle.pending).remove(&id);
-    handle.refetch(id, key, 300);
-    assert_eq!(requests.try_recv().unwrap().tick, 300);
+    handle.refetch(id, at(300));
+    assert_eq!(requests.try_recv().unwrap().request, at(300));
   }
 }

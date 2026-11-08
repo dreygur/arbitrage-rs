@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use alloy::eips::BlockId;
 use alloy::primitives::aliases::I24;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use uniswap_v3_sdk::prelude::{
   Error as SdkError, Tick, TickDataProvider, TickIndex, TickListError,
 };
 
-use crate::chain::evm::bindings::IStateView;
+use crate::chain::evm::bindings::{Call3, IStateView, Result3};
 use crate::chain::evm::multicall::{aggregate, decode, read};
 use crate::chain::evm::venue::v4::V4Key;
 use crate::error::{Error, Result};
@@ -167,50 +167,34 @@ impl TickDataProvider for BoundedTicks {
   }
 }
 
-/// Reads the initialized ticks of the pool `key` names within `words` bitmap words each side of
-/// the word holding `tick`, as of `block`.
-///
-/// Makes two Multicall3 batches to StateView, both pinned to `block` so the bitmap
-/// and the tick liquidity come from the same state: one for every bitmap word in range, then
-/// one for the liquidity of every set bit.
-pub async fn fetch_window<P: Provider>(
-  provider: &P,
-  multicall: Address,
-  state_view: Address,
-  block: BlockId,
-  key: &V4Key,
-  tick: i32,
-  words: u16,
-) -> Result<BoundedTicks> {
-  let pool_id = key.pool_id();
-  let tick_spacing = key.tick_spacing;
-  let (first, last) = word_range(tick, tick_spacing, words);
-  let (lower, upper) = BoundedTicks::bounds(tick, tick_spacing, words);
-  let bitmap_calls = (first..=last)
-    .map(|word| {
-      read(
-        state_view,
-        &IStateView::getTickBitmapCall {
-          poolId: pool_id,
-          tick: word,
-        },
-      )
-    })
-    .collect();
-  let bitmaps = aggregate(provider, multicall, block, bitmap_calls).await?;
+/// One tick window to read: the pool, the tick to center on and the bitmap words each side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowRequest {
+  /// The pool key.
+  pub key: V4Key,
+  /// Tick the window is centered on.
+  pub tick: i32,
+  /// Bitmap words read each side of the word holding `tick`.
+  pub words: u16,
+}
+
+/// Initialized tick indices in the bitmap `results` of consecutive words starting at `first`.
+fn set_ticks(results: &[Result3], first: i16, tick_spacing: i32) -> Result<Vec<i32>> {
   let mut indices = Vec::new();
-  for (word, result) in (first..=last).zip(&bitmaps) {
+  for (word, result) in (i32::from(first)..).zip(results) {
     let bitmap: U256 = decode::<IStateView::getTickBitmapCall>(result)?;
     for bit in 0..WORD_TICKS {
       if bitmap.bit(bit as usize) {
-        indices.push((i32::from(word) * WORD_TICKS + bit) * tick_spacing);
+        indices.push((word * WORD_TICKS + bit) * tick_spacing);
       }
     }
   }
-  if indices.is_empty() {
-    return Ok(BoundedTicks::new(Vec::new(), lower, upper));
-  }
-  let liquidity_calls = indices
+  Ok(indices)
+}
+
+/// Liquidity reads for every index in `indices` of the pool `pool_id`.
+fn liquidity_calls(state_view: Address, pool_id: B256, indices: &[i32]) -> Result<Vec<Call3>> {
+  indices
     .iter()
     .map(|&index| {
       let tick = I24::try_from(index).map_err(|_| Error::Overflow)?;
@@ -222,18 +206,94 @@ pub async fn fetch_window<P: Provider>(
         },
       ))
     })
-    .collect::<Result<Vec<_>>>()?;
-  let liquidity = aggregate(provider, multicall, block, liquidity_calls).await?;
-  let mut ticks = Vec::with_capacity(indices.len());
-  for (index, result) in indices.into_iter().zip(&liquidity) {
-    let values = decode::<IStateView::getTickLiquidityCall>(result)?;
-    ticks.push(Tick {
-      index,
-      liquidity_gross: values.liquidityGross,
-      liquidity_net: values.liquidityNet,
-    });
+    .collect()
+}
+
+/// Reads the initialized ticks of every requested window as of `block`, one result per request.
+///
+/// Makes two Multicall3 batches to StateView for all pools together, both pinned to `block` so
+/// the bitmaps and the tick liquidity come from the same state: one for every bitmap word in
+/// range, then one for the liquidity of every set bit. A reverted or undecodable read fails
+/// only its own pool's window; a failed request fails them all.
+pub async fn fetch_windows<P: Provider>(
+  provider: &P,
+  multicall: Address,
+  state_view: Address,
+  block: BlockId,
+  requests: &[WindowRequest],
+) -> Result<Vec<Result<BoundedTicks>>> {
+  let ranges: Vec<(i16, i16)> = requests
+    .iter()
+    .map(|r| word_range(r.tick, r.key.tick_spacing, r.words))
+    .collect();
+  let mut bitmap_calls = Vec::new();
+  for (request, &(first, last)) in requests.iter().zip(&ranges) {
+    let pool_id = request.key.pool_id();
+    for word in first..=last {
+      bitmap_calls.push(read(
+        state_view,
+        &IStateView::getTickBitmapCall {
+          poolId: pool_id,
+          tick: word,
+        },
+      ));
+    }
   }
-  Ok(BoundedTicks::new(ticks, lower, upper))
+  let bitmaps = aggregate(provider, multicall, block, bitmap_calls).await?;
+  let mut offset = 0;
+  let mut found = Vec::with_capacity(requests.len());
+  let mut tick_calls = Vec::new();
+  for (request, &(first, last)) in requests.iter().zip(&ranges) {
+    let count = (i32::from(last) - i32::from(first) + 1) as usize;
+    let words = &bitmaps[offset..offset + count];
+    offset += count;
+    let indices = set_ticks(words, first, request.key.tick_spacing).and_then(|indices| {
+      tick_calls.extend(liquidity_calls(
+        state_view,
+        request.key.pool_id(),
+        &indices,
+      )?);
+      Ok(indices)
+    });
+    found.push(indices);
+  }
+  let liquidity = aggregate(provider, multicall, block, tick_calls).await?;
+  let mut offset = 0;
+  let mut windows = Vec::with_capacity(requests.len());
+  for (request, indices) in requests.iter().zip(found) {
+    let (lower, upper) =
+      BoundedTicks::bounds(request.tick, request.key.tick_spacing, request.words);
+    let window = indices.and_then(|indices| {
+      let answers = &liquidity[offset..offset + indices.len()];
+      offset += indices.len();
+      let mut ticks = Vec::with_capacity(indices.len());
+      for (index, result) in indices.into_iter().zip(answers) {
+        let values = decode::<IStateView::getTickLiquidityCall>(result)?;
+        ticks.push(Tick {
+          index,
+          liquidity_gross: values.liquidityGross,
+          liquidity_net: values.liquidityNet,
+        });
+      }
+      Ok(BoundedTicks::new(ticks, lower, upper))
+    });
+    windows.push(window);
+  }
+  Ok(windows)
+}
+
+/// Reads the initialized ticks of one window as of `block`, as `fetch_windows` does.
+pub async fn fetch_window<P: Provider>(
+  provider: &P,
+  multicall: Address,
+  state_view: Address,
+  block: BlockId,
+  request: WindowRequest,
+) -> Result<BoundedTicks> {
+  fetch_windows(provider, multicall, state_view, block, &[request])
+    .await?
+    .pop()
+    .unwrap_or_else(|| Err(Error::Contract("no tick window returned".into())))
 }
 
 #[cfg(test)]

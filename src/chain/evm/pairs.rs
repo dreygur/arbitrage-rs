@@ -252,7 +252,9 @@ async fn probe<P: Provider>(
   Ok(found)
 }
 
-/// Base token reserve of every candidate, read in one batch; a failed read counts as empty.
+/// Base token reserve of every candidate, read in one batch; a failed read or a V4 virtual
+/// reserve that overflows counts as empty, so that pool falls below the floor instead of
+/// failing discovery.
 async fn base_reserves<P: Provider>(
   provider: &P,
   evm: &EvmConfig,
@@ -281,7 +283,9 @@ async fn base_reserves<P: Provider>(
         })
         .unwrap_or_default(),
       Tracked::V4 { .. } => match decode::<IStateView::getLiquidityCall>(result) {
-        Ok(liquidity) => virtual_base_reserve(liquidity, c.sqrt_price, c.base_first)?,
+        Ok(liquidity) => {
+          virtual_base_reserve(liquidity, c.sqrt_price, c.base_first).unwrap_or_default()
+        }
         Err(_) => Amount::ZERO,
       },
     };
@@ -574,6 +578,73 @@ mod tests {
         Tracked::V4 { venue: 1, key },
       ]
     );
+    assert!(asserter.read_q().is_empty());
+  }
+
+  /// Discovery scans the factory with fewer pairs, at most `max_scan` of them, keeps the
+  /// tokens paired with the base, and looks them up on every venue.
+  ///
+  /// The mock answers exactly two `allPairs` calls; `aggregate` rejects an answer of another
+  /// length, so scanning past `max_scan` or the wrong factory length would fail.
+  #[tokio::test]
+  async fn discover_scans_smaller_factory() {
+    let sushi = Address::repeat_byte(0x66);
+    let mut evm = mock_evm_config();
+    let mut second = evm.venues[0].clone();
+    second.name = "sushiswap".into();
+    second.address = sushi;
+    evm.venues.push(second);
+    let mut cfg = network();
+    cfg.pairs.max_scan = 2;
+    let other = Address::repeat_byte(0x23);
+    let sushi_pair = Address::repeat_byte(0x24);
+    let asserter = Asserter::new();
+    let length = |n: u64| {
+      Some(IUniswapV2Factory::allPairsLengthCall::abi_encode_returns(
+        &U256::from(n),
+      ))
+    };
+    push_multicall(&asserter, vec![length(10), length(3)]);
+    let address = |a: Address| Some(IUniswapV2Factory::allPairsCall::abi_encode_returns(&a));
+    push_multicall(&asserter, vec![address(pair()), address(other)]);
+    let holds = |a: Address| Some(IUniswapV2Pair::token0Call::abi_encode_returns(&a));
+    push_multicall(
+      &asserter,
+      vec![
+        holds(token()),
+        holds(weth()),
+        holds(Address::repeat_byte(0x12)),
+        holds(Address::repeat_byte(0x13)),
+      ],
+    );
+    let mut probes = vec![Some(IUniswapV2Factory::getPairCall::abi_encode_returns(
+      &pair(),
+    ))];
+    probes.extend(std::iter::repeat_n(None, 2 * PROBES.len()));
+    probes.push(Some(IUniswapV2Factory::getPairCall::abi_encode_returns(
+      &sushi_pair,
+    )));
+    push_multicall(&asserter, probes);
+    let reserves = IUniswapV2Pair::getReservesReturn {
+      reserve0: U112::from(1u64),
+      reserve1: U112::from(5000u64),
+      blockTimestampLast: 0,
+    };
+    let reserves = Some(IUniswapV2Pair::getReservesCall::abi_encode_returns(
+      &reserves,
+    ));
+    push_multicall(&asserter, vec![reserves.clone(), reserves]);
+    let found = discover(&mock_provider(&asserter), &cfg, &evm)
+      .await
+      .unwrap();
+    let v2 = |venue, pair| Tracked::V2 {
+      venue,
+      pair,
+      token0: token(),
+      token1: weth(),
+      fee_bps: 30,
+    };
+    assert_eq!(found, vec![v2(0, pair()), v2(2, sushi_pair)]);
     assert!(asserter.read_q().is_empty());
   }
 }
