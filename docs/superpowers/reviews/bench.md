@@ -32,3 +32,17 @@ Decisions:
 - Profile: `make run` stays on `release`. `release-max` beats `release` by 3.4% on the sequential median (19.59 ms against 20.29 ms), under the 10% bar.
 
 After the change (`release`, parallel `find_all`): `find_all_all_pairs` 4.8675 ms, `find_all_one_touched` 183.52 µs. Rayon's fan out costs about 90 µs when one group is touched, which is the common case per block; a sequential path for small touched sets would win that back if it matters.
+
+## Touched steps stay sequential (Task 10 fix round)
+
+Controller ruling: `find_all` uses rayon only for a full evaluation (`touched` is `None`). A touched step evaluates its few groups in a loop, because fanning out to the pool cost about 90 µs for a single touched group. A new case, `find_all_one_v4_touched`, touches one V4 fixture pool (its group is that pool and its V2 partner).
+
+Medians after the change, same machine and mix:
+
+| Case | `release` | `release-max` |
+| --- | --- | --- |
+| `find_all_all_pairs` (rayon) | 4.7059 ms | 4.9686 ms |
+| `find_all_one_touched` (sequential) | 93.478 µs | 129.73 µs (noisy run, spread 114 to 146 µs) |
+| `find_all_one_v4_touched` (sequential) | 392.53 µs | 394.43 µs |
+
+Sequential touched steps are back to the pre rayon baseline (94 µs). `release-max` still gives no gain worth its build time, so `make run` stays on `release`. The touched mock case is a floor set mostly by grouping all 500 pools; sizing one V4 against V2 pair through the SDK adds about 300 µs on top of it.

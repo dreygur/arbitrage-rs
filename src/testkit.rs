@@ -4,29 +4,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use alloy::primitives::{Address, U160};
-use uniswap_v3_sdk::prelude::Tick;
-
 use crate::chain::Chain;
-use crate::chain::evm::ticks::BoundedTicks;
-use crate::chain::evm::venue::v4::{V4Key, V4Pool};
 use crate::config::Live;
 use crate::error::{Error, Result};
 use crate::types::{Amount, Control, Id, Opportunity, Side, Status, Update, Verdict};
 use crate::venue::Venue;
 
+pub use crate::chain::evm::venue::v4::{v4_fixture, v4_fixture_quoting};
+
 /// Fee denominator in basis points.
 const BPS: u64 = 10_000;
-/// Tick spacing of the V4 fixture.
-const FIXTURE_SPACING: i32 = 60;
-/// Lower and upper tick of the V4 fixture's one position.
-const FIXTURE_RANGE: (i32, i32) = (-600, 600);
-/// Liquidity of the V4 fixture's position.
-const FIXTURE_LIQUIDITY: u128 = 10_000_000_000;
-/// Bitmap words fetched each side of the V4 fixture's current word.
-const FIXTURE_WORDS: u16 = 2;
-/// Square root price of tick zero, a price of one.
-const FIXTURE_SQRT_PRICE: U160 = U160::from_limbs([0, 1 << 32, 0]);
 
 /// Constant product pool with a fee, standing in for a real venue.
 pub struct MockVenue {
@@ -95,41 +82,6 @@ impl Venue for MockVenue {
   fn describe(&self) -> String {
     format!("mock {}", String::from_utf8_lossy(self.pool.as_bytes()))
   }
-}
-
-/// Hand built native ETH / `quote` V4 pool at fee 3000, spacing 60 and tick zero, with one
-/// position across ticks -600..600 and native reported as the id `base`.
-pub fn v4_fixture_quoting(quote: Address) -> V4Pool {
-  let key = V4Key {
-    currency0: Address::ZERO,
-    currency1: quote,
-    fee: 3000,
-    tick_spacing: FIXTURE_SPACING,
-    hooks: Address::ZERO,
-  };
-  let (lower, upper) = BoundedTicks::bounds(0, FIXTURE_SPACING, FIXTURE_WORDS);
-  let net = FIXTURE_LIQUIDITY as i128;
-  let ticks = vec![
-    Tick::new(FIXTURE_RANGE.0, FIXTURE_LIQUIDITY, net),
-    Tick::new(FIXTURE_RANGE.1, FIXTURE_LIQUIDITY, -net),
-  ];
-  V4Pool::new(
-    "uniswap_v4".into(),
-    Id::new(key.pool_id().to_vec()),
-    Id::new(b"base".to_vec()),
-    key,
-    (18, 18),
-    FIXTURE_SQRT_PRICE,
-    FIXTURE_LIQUIDITY,
-    0,
-    BoundedTicks::new(ticks, lower, upper),
-  )
-  .expect("fixture key is valid")
-}
-
-/// The V4 fixture quoting the token at `0x11..11`.
-pub fn v4_fixture() -> V4Pool {
-  v4_fixture_quoting(Address::repeat_byte(0x11))
 }
 
 /// Scriptable chain that records what the bot asks of it.

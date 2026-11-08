@@ -1,5 +1,12 @@
 //! Solidity interfaces the adapter talks to and the executor artifact.
 
+// `sol!` generates a constructor with one argument per event field, and the V4 `Swap` event
+// has eight; the lint fires on macro output this module cannot change.
+#![allow(
+  clippy::too_many_arguments,
+  reason = "sol! output for events with many fields"
+)]
+
 use alloy::sol;
 
 sol! {

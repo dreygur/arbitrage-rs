@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use alloy::eips::BlockId;
 use alloy::primitives::aliases::I24;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use uniswap_v3_sdk::prelude::{
@@ -11,6 +12,7 @@ use uniswap_v3_sdk::prelude::{
 };
 
 use crate::chain::evm::bindings::{Call3, IMulticall3, IStateView, Result3};
+use crate::chain::evm::venue::v4::V4Key;
 use crate::error::{Error, Result};
 
 /// Ticks covered by one bitmap word, in units of tick spacing.
@@ -43,11 +45,13 @@ fn decode<C: SolCall>(result: &Result3) -> Result<C::Return> {
   C::abi_decode_returns(&result.returnData).map_err(|e| Error::Contract(e.to_string()))
 }
 
-/// Sends `calls` to StateView through one Multicall3 `aggregate3`, failing on any reverted call.
+/// Sends `calls` to StateView through one Multicall3 `aggregate3` at `block`, failing on any
+/// reverted call.
 async fn aggregate<P: Provider>(
   provider: &P,
   multicall: Address,
   state_view: Address,
+  block: BlockId,
   calls: Vec<Vec<u8>>,
 ) -> Result<Vec<Result3>> {
   let calls = calls
@@ -61,6 +65,7 @@ async fn aggregate<P: Provider>(
   Ok(
     IMulticall3::new(multicall, provider)
       .aggregate3(calls)
+      .block(block)
       .call()
       .await?,
   )
@@ -93,11 +98,12 @@ impl BoundedTicks {
     }
   }
 
-  /// Tick bounds of the `words` bitmap words each side of the word holding `tick`.
+  /// Tick bounds of the `words` bitmap words each side of the word holding `tick`: the first
+  /// tick of the first word and the last tick before the word after the last one.
   pub fn bounds(tick: i32, tick_spacing: i32, words: u16) -> (i32, i32) {
     let (first, last) = word_range(tick, tick_spacing, words);
     let lower = i32::from(first) * WORD_TICKS * tick_spacing;
-    let upper = ((i32::from(last) + 1) * WORD_TICKS - 1) * tick_spacing;
+    let upper = (i32::from(last) + 1) * WORD_TICKS * tick_spacing - 1;
     (lower, upper)
   }
 
@@ -198,20 +204,23 @@ impl TickDataProvider for BoundedTicks {
   }
 }
 
-/// Reads the initialized ticks of `pool_id` within `words` bitmap words each side of the word
-/// holding `tick`.
+/// Reads the initialized ticks of the pool `key` names within `words` bitmap words each side of
+/// the word holding `tick`, as of `block`.
 ///
-/// Makes two Multicall3 `aggregate3` calls to StateView: one for every bitmap word in range, then
+/// Makes two Multicall3 `aggregate3` calls to StateView, both pinned to `block` so the bitmap
+/// and the tick liquidity come from the same state: one for every bitmap word in range, then
 /// one for the liquidity of every set bit.
 pub async fn fetch_window<P: Provider>(
   provider: &P,
   multicall: Address,
   state_view: Address,
-  pool_id: B256,
-  tick_spacing: i32,
+  block: BlockId,
+  key: &V4Key,
   tick: i32,
   words: u16,
 ) -> Result<BoundedTicks> {
+  let pool_id = key.pool_id();
+  let tick_spacing = key.tick_spacing;
   let (first, last) = word_range(tick, tick_spacing, words);
   let (lower, upper) = BoundedTicks::bounds(tick, tick_spacing, words);
   let bitmap_calls = (first..=last)
@@ -223,7 +232,7 @@ pub async fn fetch_window<P: Provider>(
       .abi_encode()
     })
     .collect();
-  let bitmaps = aggregate(provider, multicall, state_view, bitmap_calls).await?;
+  let bitmaps = aggregate(provider, multicall, state_view, block, bitmap_calls).await?;
   let mut indices = Vec::new();
   for (word, result) in (first..=last).zip(&bitmaps) {
     let bitmap: U256 = decode::<IStateView::getTickBitmapCall>(result)?;
@@ -249,7 +258,7 @@ pub async fn fetch_window<P: Provider>(
       )
     })
     .collect::<Result<Vec<_>>>()?;
-  let liquidity = aggregate(provider, multicall, state_view, liquidity_calls).await?;
+  let liquidity = aggregate(provider, multicall, state_view, block, liquidity_calls).await?;
   let mut ticks = Vec::with_capacity(indices.len());
   for (index, result) in indices.into_iter().zip(&liquidity) {
     let values = decode::<IStateView::getTickLiquidityCall>(result)?;
@@ -260,4 +269,48 @@ pub async fn fetch_window<P: Provider>(
     });
   }
   Ok(BoundedTicks::new(ticks, lower, upper))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use futures::FutureExt;
+
+  /// Tick spacing of the test windows.
+  const SPACING: i32 = 60;
+
+  /// Empty window over the word each side of the word holding tick zero.
+  fn window() -> BoundedTicks {
+    let (lower, upper) = BoundedTicks::bounds(0, SPACING, 1);
+    BoundedTicks::new(Vec::new(), lower, upper)
+  }
+
+  /// The window ends at the last tick of the last fetched word, not one spacing short of it.
+  #[test]
+  fn bounds_cover_whole_words() {
+    assert_eq!(BoundedTicks::bounds(0, SPACING, 1), (-15_360, 30_719));
+  }
+
+  /// A tick between the last usable tick and the end of the last word is still answered.
+  #[test]
+  fn tick_in_last_spacing_is_inside() {
+    let found = window()
+      .next_initialized_tick_within_one_word(30_700, true, SPACING)
+      .now_or_never()
+      .unwrap();
+    assert_eq!(found.unwrap(), (15_360, false));
+  }
+
+  /// Lookups and searches past the fetched words fail in both directions.
+  #[test]
+  fn past_fetched_words_errors() {
+    let ticks = window();
+    let up = ticks.next_initialized_tick_within_one_word(30_719, false, SPACING);
+    assert!(up.now_or_never().unwrap().is_err());
+    let beyond = ticks.next_initialized_tick_within_one_word(30_720, true, SPACING);
+    assert!(beyond.now_or_never().unwrap().is_err());
+    let down = ticks.next_initialized_tick_within_one_word(-15_361, true, SPACING);
+    assert!(down.now_or_never().unwrap().is_err());
+    assert!(ticks.get_tick(30_720).now_or_never().unwrap().is_err());
+  }
 }

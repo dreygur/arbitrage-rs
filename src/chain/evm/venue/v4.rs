@@ -25,6 +25,21 @@ const MAX_FEE: u32 = 1_000_000;
 const PIPS_PER_BPS: u32 = 100;
 /// Fractional bits of a Q64.96 square root price.
 const Q96_BITS: usize = 96;
+/// Tick spacing of the V4 fixture.
+#[cfg(any(test, feature = "testkit"))]
+const FIXTURE_SPACING: i32 = 60;
+/// Lower and upper tick of the V4 fixture's one position.
+#[cfg(any(test, feature = "testkit"))]
+const FIXTURE_RANGE: (i32, i32) = (-600, 600);
+/// Liquidity of the V4 fixture's position.
+#[cfg(any(test, feature = "testkit"))]
+const FIXTURE_LIQUIDITY: u128 = 10_000_000_000;
+/// Bitmap words fetched each side of the V4 fixture's current word.
+#[cfg(any(test, feature = "testkit"))]
+const FIXTURE_WORDS: u16 = 2;
+/// Square root price of tick zero, a price of one.
+#[cfg(any(test, feature = "testkit"))]
+const FIXTURE_SQRT_PRICE: U160 = U160::from_limbs([0, 1 << 32, 0]);
 
 /// Identifies a V4 pool, as the PoolManager's `PoolKey` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,8 +119,9 @@ impl V4Pool {
   /// Builds a pool from its key, decimals, slot0, liquidity and tick window.
   ///
   /// `base_alias` is the id reported for native currency (the wrapped native token), and the
-  /// side that holds it is the base side. Fails for keys the SDK cannot price: unsorted
-  /// currencies, a non positive tick spacing or a fee that is not a static LP fee.
+  /// side that holds it is the base side. Fails for keys the SDK cannot price (unsorted
+  /// currencies, a non positive tick spacing or a fee that is not a static LP fee) and for
+  /// pools where neither currency is native or `base_alias`.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     venue: String,
@@ -150,6 +166,11 @@ impl V4Pool {
     sdk.tick_current = tick;
     let token0 = token_id(key.currency0, &base_alias);
     let token1 = token_id(key.currency1, &base_alias);
+    if token0 != base_alias && token1 != base_alias {
+      return Err(Error::Config(format!(
+        "v4 pool {pool} holds neither native nor the base token"
+      )));
+    }
     Ok(Self {
       venue,
       pool,
@@ -280,6 +301,43 @@ impl Venue for V4Pool {
   }
 }
 
+/// Hand built native ETH / `quote` V4 pool for tests and benches: fee 3000, spacing 60, tick
+/// zero, one position across ticks -600..600, and native reported as the id `base`.
+#[cfg(any(test, feature = "testkit"))]
+pub fn v4_fixture_quoting(quote: Address) -> V4Pool {
+  let key = V4Key {
+    currency0: Address::ZERO,
+    currency1: quote,
+    fee: 3000,
+    tick_spacing: FIXTURE_SPACING,
+    hooks: Address::ZERO,
+  };
+  let (lower, upper) = BoundedTicks::bounds(0, FIXTURE_SPACING, FIXTURE_WORDS);
+  let net = FIXTURE_LIQUIDITY as i128;
+  let ticks = vec![
+    uniswap_v3_sdk::prelude::Tick::new(FIXTURE_RANGE.0, FIXTURE_LIQUIDITY, net),
+    uniswap_v3_sdk::prelude::Tick::new(FIXTURE_RANGE.1, FIXTURE_LIQUIDITY, -net),
+  ];
+  V4Pool::new(
+    "uniswap_v4".into(),
+    Id::new(key.pool_id().to_vec()),
+    Id::new(b"base".to_vec()),
+    key,
+    (18, 18),
+    FIXTURE_SQRT_PRICE,
+    FIXTURE_LIQUIDITY,
+    0,
+    BoundedTicks::new(ticks, lower, upper),
+  )
+  .expect("fixture key is valid")
+}
+
+/// The V4 fixture quoting the token at `0x11..11`.
+#[cfg(any(test, feature = "testkit"))]
+pub fn v4_fixture() -> V4Pool {
+  v4_fixture_quoting(Address::repeat_byte(0x11))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -389,17 +447,31 @@ mod tests {
     }
   }
 
-  /// A quote that would leave the window errors even where the full tick list fills it.
+  /// One position past both edges of a one word window, ticks -15360..=30719.
+  fn wide_position() -> Vec<Tick> {
+    position(-30_000, 60_000, L)
+  }
+
+  /// Inputs that move the price past the one word window but stay inside `wide_position`,
+  /// down past -15360 and up past 30719.
+  const PAST_WINDOW: [(Side, u128); 2] = [
+    (Side::ZeroForOne, 2_000_000_000_000_000_000),
+    (Side::OneForZero, 5_000_000_000_000_000_000),
+  ];
+
+  /// A quote that would leave the window errors in either direction, even where the full tick
+  /// list fills it.
   #[test]
   fn quote_past_window_errors() {
-    let ticks = position(-30_000, 30_000, L);
-    let pool = build(ticks.clone(), L, 0, 1);
-    let amount = 2_000_000_000_000_000_000u128;
-    assert!(reference_quote(&reference(ticks, L, 0), amount, Side::ZeroForOne).is_ok());
-    assert!(matches!(
-      pool.quote_out(Amount::from(amount), Side::ZeroForOne),
-      Err(Error::InsufficientLiquidity)
-    ));
+    let pool = build(wide_position(), L, 0, 1);
+    let reference = reference(wide_position(), L, 0);
+    for (side, amount) in PAST_WINDOW {
+      assert!(reference_quote(&reference, amount, side).is_ok());
+      assert!(matches!(
+        pool.quote_out(Amount::from(amount), side),
+        Err(Error::InsufficientLiquidity)
+      ));
+    }
   }
 
   /// Native currency is reported as the base alias.
@@ -452,20 +524,61 @@ mod tests {
     assert!(pool.quote_out(crossing, Side::ZeroForOne).is_err());
   }
 
-  /// A wider window lets a quote through that the narrow one refused.
+  /// A position starting below the current tick adds no active liquidity, only its ticks.
+  #[test]
+  fn apply_modify_outside_range_keeps_active_liquidity() {
+    let mut pool = build(position(-600, 600, L), L, 0, 2);
+    pool.apply_modify(600, 1200, L as i128).unwrap();
+    assert!(pool.describe().contains(" L=1000000000000000000 "));
+    let net = L as i128;
+    let merged = vec![
+      Tick::new(-600, L, net),
+      Tick::new(600, 2 * L, 0),
+      Tick::new(1200, L, -net),
+    ];
+    let fresh = build(merged, L, 0, 2);
+    let crossing = Amount::from(50_000_000_000_000_000u64);
+    assert_eq!(
+      pool.quote_out(crossing, Side::OneForZero).unwrap(),
+      fresh.quote_out(crossing, Side::OneForZero).unwrap()
+    );
+  }
+
+  /// A wider window lets quotes through in both directions that the narrow one refused.
   #[test]
   fn replace_window_extends_quotes() {
-    let ticks = position(-30_000, 30_000, L);
-    let mut pool = build(ticks.clone(), L, 0, 1);
-    let amount = 2_000_000_000_000_000_000u128;
+    let mut pool = build(wide_position(), L, 0, 1);
     let (lower, upper) = BoundedTicks::bounds(0, SPACING, 2);
-    pool.replace_window(BoundedTicks::new(ticks.clone(), lower, upper));
-    assert_eq!(
-      pool
-        .quote_out(Amount::from(amount), Side::ZeroForOne)
-        .unwrap(),
-      reference_quote(&reference(ticks, L, 0), amount, Side::ZeroForOne).unwrap()
+    pool.replace_window(BoundedTicks::new(wide_position(), lower, upper));
+    let reference = reference(wide_position(), L, 0);
+    for (side, amount) in PAST_WINDOW {
+      assert_eq!(
+        pool.quote_out(Amount::from(amount), side).unwrap(),
+        reference_quote(&reference, amount, side).unwrap()
+      );
+    }
+  }
+
+  /// A pool where neither currency is native or the base alias is refused.
+  #[test]
+  fn pool_without_base_rejected() {
+    let (lower, upper) = BoundedTicks::bounds(0, SPACING, 2);
+    let result = V4Pool::new(
+      "uniswap_v4".into(),
+      Id::new(vec![3; 32]),
+      weth(),
+      V4Key {
+        currency0: token(),
+        currency1: Address::repeat_byte(0x22),
+        ..key()
+      },
+      (18, 18),
+      price_at(0),
+      L,
+      0,
+      BoundedTicks::new(Vec::new(), lower, upper),
     );
+    assert!(matches!(result, Err(Error::Config(_))));
   }
 
   /// The edge flag is raised once the tick comes within one word of the window's bound.

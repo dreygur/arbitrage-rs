@@ -73,7 +73,7 @@ fn v4_venues() -> Vec<Arc<dyn Venue>> {
   venues
 }
 
-/// Times `find_all` over every pair and over a single touched pool.
+/// Times `find_all` over every pair, over one touched mock pool and over one touched V4 pool.
 fn bench_step(c: &mut Criterion) {
   let mut venues = mock_venues();
   venues.extend(v4_venues());
@@ -96,6 +96,16 @@ fn bench_step(c: &mut Criterion) {
   });
   c.bench_function("find_all_one_touched", |b| {
     b.iter(|| find_all(black_box(&venues), &base, max_trade, Some(&touched)))
+  });
+  let v4_pool = venues
+    .iter()
+    .find(|v| v.describe().starts_with("uniswap_v4"))
+    .expect("the mix holds V4 pools")
+    .pool()
+    .clone();
+  let touched_v4: HashSet<Id> = HashSet::from([v4_pool]);
+  c.bench_function("find_all_one_v4_touched", |b| {
+    b.iter(|| find_all(black_box(&venues), &base, max_trade, Some(&touched_v4)))
   });
 }
 

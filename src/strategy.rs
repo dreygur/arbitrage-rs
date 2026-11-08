@@ -10,6 +10,9 @@ use crate::sizing::{best_amount, gain};
 use crate::types::{Amount, Id, Opportunity};
 use crate::venue::{Venue, side_for};
 
+/// A trade with the venues it buys on and sells on.
+type Priced = (Opportunity, Arc<dyn Venue>, Arc<dyn Venue>);
+
 /// Outcome of evaluating one token pair across all of its venues.
 pub enum Evaluation {
   /// The best profitable trade of the group.
@@ -95,7 +98,7 @@ fn size_one_failure(a: &Arc<dyn Venue>, b: &Arc<dyn Venue>, base: &Id) -> Option
 
 /// Evaluates one group of venues sharing a token pair.
 fn evaluate_group(group: &[Arc<dyn Venue>], base: &Id, max_trade: Amount) -> Option<Evaluation> {
-  let mut best: Option<(Opportunity, Arc<dyn Venue>, Arc<dyn Venue>)> = None;
+  let mut best: Option<Priced> = None;
   let mut failure = None;
   for (i, a) in group.iter().enumerate() {
     for b in &group[i + 1..] {
@@ -141,9 +144,11 @@ fn evaluate_group(group: &[Arc<dyn Venue>], base: &Id, max_trade: Amount) -> Opt
 /// Venues are grouped by unordered token pair. When `touched` is given, only groups with a
 /// pool in it are evaluated. Results are `Found` by profit descending, then `Failed`.
 ///
-/// Groups are evaluated in parallel on the rayon pool; the step bench measured this well over
-/// 20% faster than a sequential loop (see `docs/superpowers/reviews/bench.md`). Results keep
-/// group order, so the output is deterministic.
+/// A full evaluation (`touched` is `None`) runs the groups in parallel on the rayon pool,
+/// which the step bench measured well over 20% faster than a loop. A touched step runs
+/// its few groups in a loop, since fanning out to the pool costs more than it saves there
+/// (see `docs/superpowers/reviews/bench.md`). Both keep group order, so the output is
+/// deterministic.
 pub fn find_all(
   venues: &[Arc<dyn Venue>],
   base: &Id,
@@ -164,11 +169,17 @@ pub fn find_all(
     groups.entry(key).or_default().push(venue.clone());
   }
   let groups: Vec<Vec<Arc<dyn Venue>>> = groups.into_values().collect();
-  let evaluations: Vec<Evaluation> = groups
-    .par_iter()
-    .filter(|group| touched.is_none_or(|set| group.iter().any(|v| set.contains(v.pool()))))
-    .filter_map(|group| evaluate_group(group, base, max_trade))
-    .collect();
+  let evaluations: Vec<Evaluation> = match touched {
+    None => groups
+      .par_iter()
+      .filter_map(|group| evaluate_group(group, base, max_trade))
+      .collect(),
+    Some(set) => groups
+      .iter()
+      .filter(|group| group.iter().any(|v| set.contains(v.pool())))
+      .filter_map(|group| evaluate_group(group, base, max_trade))
+      .collect(),
+  };
   let (mut found, failed): (Vec<Evaluation>, Vec<Evaluation>) = evaluations
     .into_iter()
     .partition(|e| matches!(e, Evaluation::Found { .. }));
