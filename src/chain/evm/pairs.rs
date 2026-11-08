@@ -584,8 +584,10 @@ mod tests {
   /// Discovery scans the factory with fewer pairs, at most `max_scan` of them, keeps the
   /// tokens paired with the base, and looks them up on every venue.
   ///
-  /// The mock answers exactly two `allPairs` calls; `aggregate` rejects an answer of another
-  /// length, so scanning past `max_scan` or the wrong factory length would fail.
+  /// The factories hold 10 and 2 pairs with `max_scan` 3, so scanning the smaller one makes
+  /// exactly two `allPairs` calls and scanning the larger would make three. The mock answers
+  /// two, and `aggregate` rejects an answer whose length differs from the calls sent, so the
+  /// test passes only when the smaller factory was chosen.
   #[tokio::test]
   async fn discover_scans_smaller_factory() {
     let sushi = Address::repeat_byte(0x66);
@@ -595,7 +597,7 @@ mod tests {
     second.address = sushi;
     evm.venues.push(second);
     let mut cfg = network();
-    cfg.pairs.max_scan = 2;
+    cfg.pairs.max_scan = 3;
     let other = Address::repeat_byte(0x23);
     let sushi_pair = Address::repeat_byte(0x24);
     let asserter = Asserter::new();
@@ -604,7 +606,7 @@ mod tests {
         &U256::from(n),
       ))
     };
-    push_multicall(&asserter, vec![length(10), length(3)]);
+    push_multicall(&asserter, vec![length(10), length(2)]);
     let address = |a: Address| Some(IUniswapV2Factory::allPairsCall::abi_encode_returns(&a));
     push_multicall(&asserter, vec![address(pair()), address(other)]);
     let holds = |a: Address| Some(IUniswapV2Pair::token0Call::abi_encode_returns(&a));
