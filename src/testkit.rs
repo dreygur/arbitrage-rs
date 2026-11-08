@@ -1,7 +1,13 @@
 //! Shared test doubles.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::chain::Chain;
+use crate::config::Live;
 use crate::error::{Error, Result};
-use crate::types::{Amount, Id, Side};
+use crate::types::{Amount, Control, Id, Opportunity, Side, Status, Update, Verdict};
 use crate::venue::Venue;
 
 /// Fee denominator in basis points.
@@ -73,5 +79,123 @@ impl Venue for MockVenue {
   /// Returns `mock {pool}`.
   fn describe(&self) -> String {
     format!("mock {}", String::from_utf8_lossy(self.pool.as_bytes()))
+  }
+}
+
+/// Scriptable chain that records what the bot asks of it.
+pub struct MockChain {
+  /// Base token id.
+  base: Id,
+  /// Pools returned by `snapshots`.
+  venues: Vec<Arc<dyn Venue>>,
+  /// Scripted results for `changes`, front first; an empty script errors.
+  updates: Mutex<VecDeque<Result<Update>>>,
+  /// Cost per buy pool; pools without an entry cost zero.
+  costs: Mutex<HashMap<Id, Option<Amount>>>,
+  /// Verdict returned for every submitted opportunity.
+  verdict: Mutex<Verdict>,
+  /// Every batch passed to `submit`.
+  pub submits: Mutex<Vec<Vec<Opportunity>>>,
+  /// Every command passed to `control`.
+  pub controls: Mutex<Vec<Control>>,
+  /// Value returned by `in_flight`.
+  pub in_flight: AtomicUsize,
+  /// Value returned by `status`.
+  pub status: Mutex<Status>,
+}
+
+impl MockChain {
+  /// Builds a chain over `venues` whose base token id is the UTF8 bytes of `base`.
+  pub fn new(base: &str, venues: Vec<Arc<dyn Venue>>) -> Self {
+    Self {
+      base: Id::new(base.as_bytes().to_vec()),
+      venues,
+      updates: Mutex::new(VecDeque::new()),
+      costs: Mutex::new(HashMap::new()),
+      verdict: Mutex::new(Verdict::Sent),
+      submits: Mutex::new(Vec::new()),
+      controls: Mutex::new(Vec::new()),
+      in_flight: AtomicUsize::new(0),
+      status: Mutex::new(Status {
+        block: 0,
+        next_base_fee: 0,
+        fee_cap: 0,
+        max_fee_per_gas: 0,
+        feed_lag_ms: 0,
+        executor: String::new(),
+        executor_balance: Amount::ZERO,
+        treasury: String::new(),
+        treasury_balance: Amount::ZERO,
+        accounts: Vec::new(),
+      }),
+    }
+  }
+
+  /// Queues the result the next unanswered `changes` call returns.
+  pub fn push_update(&self, update: Result<Update>) {
+    self.updates.lock().unwrap().push_back(update);
+  }
+
+  /// Sets the cost of trades buying on `pool`; `None` means the fee cap is hit.
+  pub fn set_cost(&self, pool: &str, cost: Option<Amount>) {
+    let pool = Id::new(pool.as_bytes().to_vec());
+    self.costs.lock().unwrap().insert(pool, cost);
+  }
+
+  /// Sets the verdict `submit` returns for every opportunity.
+  pub fn set_verdict(&self, verdict: Verdict) {
+    *self.verdict.lock().unwrap() = verdict;
+  }
+}
+
+impl Chain for MockChain {
+  /// Pops the next scripted result, or reports an exhausted script.
+  async fn changes(&self) -> Result<Update> {
+    let next = self.updates.lock().unwrap().pop_front();
+    next.unwrap_or_else(|| Err(Error::Rpc("script exhausted".into())))
+  }
+
+  /// Returns the configured pools.
+  fn snapshots(&self) -> Vec<Arc<dyn Venue>> {
+    self.venues.clone()
+  }
+
+  /// Returns the scripted cost of the buy pool, zero when none is set.
+  fn cost(&self, op: &Opportunity) -> Option<Amount> {
+    let costs = self.costs.lock().unwrap();
+    costs
+      .get(&op.buy_pool)
+      .copied()
+      .unwrap_or(Some(Amount::ZERO))
+  }
+
+  /// Records the batch and answers every opportunity with the scripted verdict.
+  async fn submit(&self, ops: Vec<Opportunity>) -> Vec<(Opportunity, Verdict)> {
+    self.submits.lock().unwrap().push(ops.clone());
+    let verdict = *self.verdict.lock().unwrap();
+    ops.into_iter().map(|op| (op, verdict)).collect()
+  }
+
+  /// Ignores live settings.
+  fn apply_live(&self, _live: &Live) {}
+
+  /// Records the command.
+  fn control(&self, command: Control) {
+    self.controls.lock().unwrap().push(command);
+  }
+
+  /// Returns the settable in flight count.
+  fn in_flight(&self) -> usize {
+    self.in_flight.load(Ordering::SeqCst)
+  }
+
+  /// Returns the base token id.
+  fn base(&self) -> Id {
+    self.base.clone()
+  }
+
+  /// Returns the settable status.
+  fn status(&self) -> Status {
+    self.status.lock().unwrap().clone()
   }
 }
