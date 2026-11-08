@@ -1,5 +1,6 @@
 //! Chain neutral flash arbitrage core.
 
+pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod sizing;
