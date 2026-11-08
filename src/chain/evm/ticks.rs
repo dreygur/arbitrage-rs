@@ -6,12 +6,12 @@ use alloy::eips::BlockId;
 use alloy::primitives::aliases::I24;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolCall;
 use uniswap_v3_sdk::prelude::{
   Error as SdkError, Tick, TickDataProvider, TickIndex, TickListError,
 };
 
-use crate::chain::evm::bindings::{Call3, IMulticall3, IStateView, Result3};
+use crate::chain::evm::bindings::IStateView;
+use crate::chain::evm::multicall::{aggregate, decode, read};
 use crate::chain::evm::venue::v4::V4Key;
 use crate::error::{Error, Result};
 
@@ -32,43 +32,6 @@ fn word_range(tick: i32, tick_spacing: i32, words: u16) -> (i16, i16) {
   let first = (word - words).max(i32::from(i16::MIN));
   let last = (word + words).min(i32::from(i16::MAX));
   (first as i16, last as i16)
-}
-
-/// Decodes one Multicall3 result as the return value of call `C`.
-fn decode<C: SolCall>(result: &Result3) -> Result<C::Return> {
-  if !result.success {
-    return Err(Error::Contract(format!(
-      "{} failed in multicall",
-      C::SIGNATURE
-    )));
-  }
-  C::abi_decode_returns(&result.returnData).map_err(|e| Error::Contract(e.to_string()))
-}
-
-/// Sends `calls` to StateView through one Multicall3 `aggregate3` at `block`, failing on any
-/// reverted call.
-async fn aggregate<P: Provider>(
-  provider: &P,
-  multicall: Address,
-  state_view: Address,
-  block: BlockId,
-  calls: Vec<Vec<u8>>,
-) -> Result<Vec<Result3>> {
-  let calls = calls
-    .into_iter()
-    .map(|data| Call3 {
-      target: state_view,
-      allowFailure: false,
-      callData: data.into(),
-    })
-    .collect();
-  Ok(
-    IMulticall3::new(multicall, provider)
-      .aggregate3(calls)
-      .block(block)
-      .call()
-      .await?,
-  )
 }
 
 /// Initialized ticks known between `lower` and `upper` inclusive.
@@ -207,7 +170,7 @@ impl TickDataProvider for BoundedTicks {
 /// Reads the initialized ticks of the pool `key` names within `words` bitmap words each side of
 /// the word holding `tick`, as of `block`.
 ///
-/// Makes two Multicall3 `aggregate3` calls to StateView, both pinned to `block` so the bitmap
+/// Makes two Multicall3 batches to StateView, both pinned to `block` so the bitmap
 /// and the tick liquidity come from the same state: one for every bitmap word in range, then
 /// one for the liquidity of every set bit.
 pub async fn fetch_window<P: Provider>(
@@ -225,14 +188,16 @@ pub async fn fetch_window<P: Provider>(
   let (lower, upper) = BoundedTicks::bounds(tick, tick_spacing, words);
   let bitmap_calls = (first..=last)
     .map(|word| {
-      IStateView::getTickBitmapCall {
-        poolId: pool_id,
-        tick: word,
-      }
-      .abi_encode()
+      read(
+        state_view,
+        &IStateView::getTickBitmapCall {
+          poolId: pool_id,
+          tick: word,
+        },
+      )
     })
     .collect();
-  let bitmaps = aggregate(provider, multicall, state_view, block, bitmap_calls).await?;
+  let bitmaps = aggregate(provider, multicall, block, bitmap_calls).await?;
   let mut indices = Vec::new();
   for (word, result) in (first..=last).zip(&bitmaps) {
     let bitmap: U256 = decode::<IStateView::getTickBitmapCall>(result)?;
@@ -249,16 +214,16 @@ pub async fn fetch_window<P: Provider>(
     .iter()
     .map(|&index| {
       let tick = I24::try_from(index).map_err(|_| Error::Overflow)?;
-      Ok(
-        IStateView::getTickLiquidityCall {
+      Ok(read(
+        state_view,
+        &IStateView::getTickLiquidityCall {
           poolId: pool_id,
           tick,
-        }
-        .abi_encode(),
-      )
+        },
+      ))
     })
     .collect::<Result<Vec<_>>>()?;
-  let liquidity = aggregate(provider, multicall, state_view, block, liquidity_calls).await?;
+  let liquidity = aggregate(provider, multicall, block, liquidity_calls).await?;
   let mut ticks = Vec::with_capacity(indices.len());
   for (index, result) in indices.into_iter().zip(&liquidity) {
     let values = decode::<IStateView::getTickLiquidityCall>(result)?;

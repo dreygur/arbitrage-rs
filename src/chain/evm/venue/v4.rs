@@ -88,11 +88,32 @@ fn currency(address: Address, decimals: u8) -> Currency {
 }
 
 /// Id the core sees for `address`: `base_alias` for native, else the address.
-fn token_id(address: Address, base_alias: &Id) -> Id {
+pub fn token_id(address: Address, base_alias: &Id) -> Id {
   if address == Address::ZERO {
     base_alias.clone()
   } else {
     to_id(address)
+  }
+}
+
+/// Base token amount `liquidity` stands for at `sqrt_price`, in integer math.
+///
+/// `L * 2^96 / sqrtP` when the base is currency zero (`base_first`), `L * sqrtP / 2^96`
+/// otherwise. Discovery uses it before a pool is built, `V4Pool::base_reserve` after.
+pub fn virtual_base_reserve(liquidity: u128, sqrt_price: U160, base_first: bool) -> Result<Amount> {
+  let liquidity = Amount::from(liquidity);
+  let sqrt_price = Amount::from(sqrt_price);
+  let q96 = Amount::from(1u64) << Q96_BITS;
+  if base_first {
+    liquidity
+      .checked_mul(q96)
+      .and_then(|v| v.checked_div(sqrt_price))
+      .ok_or(Error::Overflow)
+  } else {
+    liquidity
+      .checked_mul(sqrt_price)
+      .map(|v| v >> Q96_BITS)
+      .ok_or(Error::Overflow)
   }
 }
 
@@ -225,24 +246,14 @@ impl V4Pool {
     tick - ticks.lower() < span || ticks.upper() - tick < span
   }
 
+  /// Current tick, the center a refetched window is built around.
+  pub fn tick(&self) -> i32 {
+    self.sdk.tick_current
+  }
+
   /// Base token amount the in range liquidity stands for, in integer math.
-  ///
-  /// `L * 2^96 / sqrtP` when the base is currency zero, `L * sqrtP / 2^96` otherwise.
   pub fn base_reserve(&self) -> Result<Amount> {
-    let liquidity = Amount::from(self.sdk.liquidity);
-    let sqrt_price = Amount::from(self.sdk.sqrt_price_x96);
-    let q96 = Amount::from(1u64) << Q96_BITS;
-    if self.base_first {
-      liquidity
-        .checked_mul(q96)
-        .and_then(|v| v.checked_div(sqrt_price))
-        .ok_or(Error::Overflow)
-    } else {
-      liquidity
-        .checked_mul(sqrt_price)
-        .map(|v| v >> Q96_BITS)
-        .ok_or(Error::Overflow)
-    }
+    virtual_base_reserve(self.sdk.liquidity, self.sdk.sqrt_price_x96, self.base_first)
   }
 }
 

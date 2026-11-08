@@ -4,7 +4,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use alloy::primitives::{Address, Bytes};
+use alloy::providers::mock::Asserter;
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::sol_types::SolCall;
+
 use crate::chain::Chain;
+use crate::chain::evm::bindings::{IMulticall3, Result3};
+use crate::chain::evm::config::{EvmConfig, EvmVenue, Family};
 use crate::config::Live;
 use crate::error::{Error, Result};
 use crate::types::{Amount, Control, Id, Opportunity, Side, Status, Update, Verdict};
@@ -14,6 +21,60 @@ pub use crate::chain::evm::venue::v4::{v4_fixture, v4_fixture_quoting};
 
 /// Fee denominator in basis points.
 const BPS: u64 = 10_000;
+
+/// Provider that answers each request with the next response queued on `asserter`.
+pub fn mock_provider(asserter: &Asserter) -> impl Provider + Clone + 'static {
+  ProviderBuilder::new().connect_mocked_client(asserter.clone())
+}
+
+/// Adapter settings with one V2 venue (`uniswap_v2`, factory `0x55..55`, 30 bps) and one V4
+/// venue (`uniswap_v4`, PoolManager `0x44..44`, one tick word), StateView `0x33..33` and
+/// Multicall3 `0xca..ca`.
+pub fn mock_evm_config() -> EvmConfig {
+  EvmConfig {
+    chain_id: 1,
+    pool_manager: Address::repeat_byte(0x44),
+    state_view: Address::repeat_byte(0x33),
+    multicall: Address::repeat_byte(0xca),
+    priority_fee: 1_000_000_000,
+    max_fee_per_gas: 50_000_000_000,
+    gas_v2_v2: 250_000,
+    gas_v2_v4: 300_000,
+    gas_v4_v4: 350_000,
+    max_gas_limit: 1_000_000,
+    venues: vec![
+      EvmVenue {
+        name: "uniswap_v2".into(),
+        family: Family::V2,
+        address: Address::repeat_byte(0x55),
+        fee_bps: Some(30),
+        tick_words: None,
+      },
+      EvmVenue {
+        name: "uniswap_v4".into(),
+        family: Family::V4,
+        address: Address::repeat_byte(0x44),
+        fee_bps: None,
+        tick_words: Some(1),
+      },
+    ],
+    fork: None,
+  }
+}
+
+/// Queues one Multicall3 `aggregate3` answer: `Some(data)` is a call that returned `data`,
+/// `None` one that reverted.
+pub fn push_multicall(asserter: &Asserter, results: Vec<Option<Vec<u8>>>) {
+  let results: Vec<Result3> = results
+    .into_iter()
+    .map(|data| Result3 {
+      success: data.is_some(),
+      returnData: data.unwrap_or_default().into(),
+    })
+    .collect();
+  let encoded = IMulticall3::aggregate3Call::abi_encode_returns(&results);
+  asserter.push_success(&Bytes::from(encoded));
+}
 
 /// Constant product pool with a fee, standing in for a real venue.
 pub struct MockVenue {
