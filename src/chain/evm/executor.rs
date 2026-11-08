@@ -1,9 +1,11 @@
 //! Executor lifecycle: reuse the deployed `FlashArbitrage` named in `.arbitrage-<network>.json`
 //! when it still fits the config, otherwise deploy a new one from the owner and record it.
 //!
-//! The deploy and every `setOperator` obey the same gas caps as the engine's transactions:
-//! nothing is sent while the fee per gas is over the cap, each is signed with the engine's fee
-//! cap and tip, and its gas limit never passes `max_gas_limit`.
+//! The deploy and every `setOperator` obey the fee cap the engine's transactions do: nothing
+//! is sent while the fee per gas is over it, and each is signed with the engine's fee cap and
+//! tip. They are not trades, so `max_gas_limit` and `max_gas_cost`, the per trade caps, do
+//! not bind them: the limit is the node's estimate plus 20%, and the worst case cost is
+//! logged before each is sent.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -16,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::chain::evm::bindings::FlashArbitrage;
 use crate::chain::evm::config::EvmConfig;
-use crate::chain::evm::gas::{fee_cap, fee_per_gas, next_base_fee};
+use crate::chain::evm::gas::{fee_cap, fee_per_gas, gas_cost, next_base_fee};
 use crate::error::{Error, Result};
 
 /// Gas limit headroom over the node's estimate, as `6 / 5` (20%).
@@ -52,16 +54,12 @@ pub fn setup_fees(next_base_fee: u128, evm: &EvmConfig) -> Result<(u128, u128)> 
   Ok((fee_cap(next_base_fee, evm), evm.priority_fee))
 }
 
-/// The gas limit for an owner transaction the node estimated at `estimate`: 20% headroom,
-/// capped at `max_gas_limit`, or an error when the estimate alone is above it.
-pub fn setup_gas(estimate: u64, max_gas_limit: u64) -> Result<u64> {
-  if estimate > max_gas_limit {
-    return Err(Error::Contract(format!(
-      "transaction needs {estimate} gas, above max_gas_limit {max_gas_limit}"
-    )));
-  }
+/// The gas limit for an owner setup transaction the node estimated at `estimate`: 20%
+/// headroom and no `max_gas_limit` clamp, since that caps trades and the deploy alone needs
+/// more than a trade.
+pub fn setup_gas(estimate: u64) -> u64 {
   let padded = u128::from(estimate) * u128::from(HEADROOM.0) / u128::from(HEADROOM.1);
-  Ok(u64::try_from(padded).unwrap_or(u64::MAX).min(max_gas_limit))
+  u64::try_from(padded).unwrap_or(u64::MAX)
 }
 
 /// The `setOperator` calls that bring the contract in line with `configured`: a grant for
@@ -146,7 +144,8 @@ fn write_record(path: &Path, record: &ExecutorRecord) -> Result<()> {
   Ok(())
 }
 
-/// Deploys a new executor from the owner within the gas caps, returning its address.
+/// Deploys a new executor from the owner under the fee cap, logging its worst case cost
+/// first, and returns its address.
 async fn deploy<P: Provider>(
   provider: &P,
   evm: &EvmConfig,
@@ -162,7 +161,8 @@ async fn deploy<P: Provider>(
     treasury,
     operators.to_vec(),
   );
-  let gas = setup_gas(builder.estimate_gas().await?, evm.max_gas_limit)?;
+  let gas = setup_gas(builder.estimate_gas().await?);
+  info!(gas, fee_cap = cap, worst_case = %gas_cost(gas, cap), "deploying executor");
   let address = builder
     .gas(gas)
     .max_fee_per_gas(cap)
@@ -172,8 +172,8 @@ async fn deploy<P: Provider>(
   Ok(address)
 }
 
-/// Sends each `setOperator` in `changes` from the owner within the gas caps, waiting for
-/// every receipt.
+/// Sends each `setOperator` in `changes` from the owner under the fee cap, logging each one's
+/// worst case cost first, and waits for every receipt.
 async fn apply_operators<P: Provider>(
   provider: &P,
   evm: &EvmConfig,
@@ -187,7 +187,8 @@ async fn apply_operators<P: Provider>(
   let contract = FlashArbitrage::new(executor, provider);
   for &(operator, allowed) in changes {
     let call = contract.setOperator(operator, allowed);
-    let gas = setup_gas(call.estimate_gas().await?, evm.max_gas_limit)?;
+    let gas = setup_gas(call.estimate_gas().await?);
+    info!(%operator, allowed, gas, fee_cap = cap, worst_case = %gas_cost(gas, cap), "sending setOperator");
     let receipt = call
       .gas(gas)
       .max_fee_per_gas(cap)
@@ -318,16 +319,15 @@ mod tests {
     );
   }
 
-  /// The gas limit pads the estimate by 20% but never passes `max_gas_limit`, and an estimate
-  /// above it is refused.
+  /// The setup gas limit is the estimate plus 20%, and the executor deploy's 1.37M estimate
+  /// gets its limit even though it is above the 1M per trade `max_gas_limit`.
   #[test]
-  fn setup_gas_capped() {
-    assert_eq!(setup_gas(100_000, 1_000_000).unwrap(), 120_000);
-    assert_eq!(setup_gas(900_000, 1_000_000).unwrap(), 1_000_000);
-    assert!(matches!(
-      setup_gas(1_370_687, 1_000_000),
-      Err(Error::Contract(_))
-    ));
+  fn deploy_gas_not_bound_by_max_gas_limit() {
+    let evm = mock_evm_config();
+    assert_eq!(setup_gas(100_000), 120_000);
+    let deploy = setup_gas(1_370_687);
+    assert_eq!(deploy, 1_644_824);
+    assert!(deploy > evm.max_gas_limit);
   }
 
   /// New operators are granted, dropped ones still holding the role are revoked, and
