@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::error::{Error, Result};
 use crate::types::TradeEvent;
@@ -55,9 +55,31 @@ fn now_rfc3339() -> String {
   format_rfc3339(secs)
 }
 
-/// Serializes the entry and appends it as one flushed line.
-async fn write_entry(file: &mut tokio::fs::File, entry: &JournalEntry) -> Result<()> {
-  let mut line = serde_json::to_vec(entry)?;
+/// Reports whether the file is non empty and its last byte is not a newline.
+async fn ends_torn(path: &Path) -> Result<bool> {
+  let len = tokio::fs::metadata(path).await?.len();
+  if len == 0 {
+    return Ok(false);
+  }
+  let mut file = tokio::fs::File::open(path).await?;
+  file.seek(std::io::SeekFrom::Start(len - 1)).await?;
+  let mut last = [0u8; 1];
+  file.read_exact(&mut last).await?;
+  Ok(last[0] != b'\n')
+}
+
+/// Serializes the entry and appends it as one flushed line, led by a
+/// newline when `terminate` is set so a torn line is not glued to it.
+async fn write_entry(
+  file: &mut tokio::fs::File,
+  entry: &JournalEntry,
+  terminate: bool,
+) -> Result<()> {
+  let mut line = Vec::new();
+  if terminate {
+    line.push(b'\n');
+  }
+  serde_json::to_writer(&mut line, entry)?;
   line.push(b'\n');
   file.write_all(&line).await?;
   file.flush().await?;
@@ -96,6 +118,7 @@ impl Journal {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
       tokio::fs::create_dir_all(dir).await?;
     }
+    let torn = path.exists() && ends_torn(&path).await?;
     let mut file = tokio::fs::OpenOptions::new()
       .append(true)
       .create(true)
@@ -103,9 +126,14 @@ impl Journal {
       .await?;
     let (tx, mut rx) = mpsc::channel::<JournalEntry>(CHANNEL_CAPACITY);
     tokio::spawn(async move {
+      let mut terminate = torn;
       while let Some(entry) = rx.recv().await {
-        if let Err(e) = write_entry(&mut file, &entry).await {
-          error!(error = %e, "journal write failed");
+        match write_entry(&mut file, &entry, terminate).await {
+          Ok(()) => terminate = false,
+          Err(e) => {
+            terminate = true;
+            error!(error = %e, "journal write failed");
+          }
         }
       }
     });
@@ -115,17 +143,27 @@ impl Journal {
 
 /// Reads the journal and returns its last `n` entries in file order.
 ///
-/// A line that does not parse is an error naming its line number.
+/// A malformed line is an error naming its line number, except a final line
+/// without a trailing newline, which a crash may have torn and is skipped.
+// Reads the whole file: a journal holds a handful of lines per trade, so it stays small.
 pub async fn read_last(path: &Path, n: usize) -> Result<Vec<JournalEntry>> {
   let text = tokio::fs::read_to_string(path).await?;
+  let unterminated = !text.ends_with('\n');
+  let total = text.lines().count();
   let mut entries = Vec::new();
   for (index, line) in text.lines().enumerate() {
     if line.trim().is_empty() {
       continue;
     }
-    let entry = serde_json::from_str(line)
-      .map_err(|e| Error::Config(format!("journal line {}: {e}", index + 1)))?;
-    entries.push(entry);
+    match serde_json::from_str(line) {
+      Ok(entry) => entries.push(entry),
+      Err(e) if unterminated && index + 1 == total => {
+        warn!(line = index + 1, error = %e, "skipping torn final journal line");
+      }
+      Err(e) => {
+        return Err(Error::Config(format!("journal line {}: {e}", index + 1)));
+      }
+    }
   }
   let start = entries.len().saturating_sub(n);
   Ok(entries.split_off(start))
@@ -248,5 +286,49 @@ mod tests {
     tokio::fs::write(&path, text).await.unwrap();
     let err = read_last(&path, 3).await.unwrap_err();
     assert!(err.to_string().contains("line 6"));
+  }
+
+  /// A torn last line gets a newline on spawn so the next entry stands alone.
+  #[tokio::test]
+  async fn spawn_terminates_torn_last_line() {
+    let path = temp_path("torn-spawn", "trades.jsonl");
+    tokio::fs::create_dir_all(path.parent().unwrap())
+      .await
+      .unwrap();
+    tokio::fs::write(&path, "{\"ts\":\"2026-11-08T00:00:00Z\",\"eve")
+      .await
+      .unwrap();
+    let tx = Journal::spawn(&path).await.unwrap();
+    tx.record(event(7)).await;
+    wait_for_lines(&path, 2).await;
+    let text = tokio::fs::read_to_string(&path).await.unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].ends_with("\"eve"));
+    assert_eq!(
+      serde_json::from_str::<JournalEntry>(lines[1])
+        .unwrap()
+        .event
+        .id,
+      7
+    );
+  }
+
+  /// A malformed final line without a newline is skipped, interior ones error.
+  #[tokio::test]
+  async fn read_last_skips_torn_final_line() {
+    let path = temp_path("torn-read", "trades.jsonl");
+    let tx = Journal::spawn(&path).await.unwrap();
+    tx.record(event(1)).await;
+    wait_for_lines(&path, 1).await;
+    let mut text = tokio::fs::read_to_string(&path).await.unwrap();
+    text.push_str("{\"ts\":\"torn");
+    tokio::fs::write(&path, &text).await.unwrap();
+    let entries = read_last(&path, 5).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    text.push('\n');
+    tokio::fs::write(&path, &text).await.unwrap();
+    let err = read_last(&path, 5).await.unwrap_err();
+    assert!(err.to_string().contains("line 2"));
   }
 }
