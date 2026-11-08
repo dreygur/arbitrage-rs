@@ -878,6 +878,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "futures",
+ "rayon",
  "ruint",
  "serde",
  "serde_json",

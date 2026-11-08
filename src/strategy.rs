@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::error::{Error, Result};
 use crate::sizing::{best_amount, gain};
 use crate::types::{Amount, Id, Opportunity};
@@ -138,6 +140,10 @@ fn evaluate_group(group: &[Arc<dyn Venue>], base: &Id, max_trade: Amount) -> Opt
 ///
 /// Venues are grouped by unordered token pair. When `touched` is given, only groups with a
 /// pool in it are evaluated. Results are `Found` by profit descending, then `Failed`.
+///
+/// Groups are evaluated in parallel on the rayon pool; the step bench measured this well over
+/// 20% faster than a sequential loop (see `docs/superpowers/reviews/bench.md`). Results keep
+/// group order, so the output is deterministic.
 pub fn find_all(
   venues: &[Arc<dyn Venue>],
   base: &Id,
@@ -157,18 +163,15 @@ pub fn find_all(
     };
     groups.entry(key).or_default().push(venue.clone());
   }
-  let mut found = Vec::new();
-  let mut failed = Vec::new();
-  for group in groups.values() {
-    if touched.is_some_and(|set| !group.iter().any(|v| set.contains(v.pool()))) {
-      continue;
-    }
-    match evaluate_group(group, base, max_trade) {
-      Some(found_one @ Evaluation::Found { .. }) => found.push(found_one),
-      Some(failure) => failed.push(failure),
-      None => {}
-    }
-  }
+  let groups: Vec<Vec<Arc<dyn Venue>>> = groups.into_values().collect();
+  let evaluations: Vec<Evaluation> = groups
+    .par_iter()
+    .filter(|group| touched.is_none_or(|set| group.iter().any(|v| set.contains(v.pool()))))
+    .filter_map(|group| evaluate_group(group, base, max_trade))
+    .collect();
+  let (mut found, failed): (Vec<Evaluation>, Vec<Evaluation>) = evaluations
+    .into_iter()
+    .partition(|e| matches!(e, Evaluation::Found { .. }));
   found.sort_by(|x, y| match (x, y) {
     (Evaluation::Found { op: ox, .. }, Evaluation::Found { op: oy, .. }) => {
       oy.profit.cmp(&ox.profit)
