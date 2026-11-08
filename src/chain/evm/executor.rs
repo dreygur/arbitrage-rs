@@ -82,7 +82,7 @@ pub fn operator_changes(
 }
 
 /// The fee cap and tip for owner transactions sent now, from the latest block's base fee.
-async fn current_fees<P: Provider>(provider: &P, evm: &EvmConfig) -> Result<(u128, u128)> {
+pub async fn current_fees<P: Provider>(provider: &P, evm: &EvmConfig) -> Result<(u128, u128)> {
   let block = provider
     .get_block_by_number(BlockNumberOrTag::Latest)
     .await?
@@ -128,7 +128,7 @@ pub fn executor_action(
 }
 
 /// Reads the record at `path`, `None` when the file does not exist.
-fn read_record(path: &Path) -> Result<Option<ExecutorRecord>> {
+pub fn read_record(path: &Path) -> Result<Option<ExecutorRecord>> {
   match std::fs::read_to_string(path) {
     Ok(text) => serde_json::from_str(&text)
       .map(Some)

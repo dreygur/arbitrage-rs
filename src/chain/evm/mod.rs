@@ -13,6 +13,7 @@ pub mod convert;
 pub mod engine;
 pub mod executor;
 pub mod feed;
+pub mod fund;
 pub mod gas;
 pub mod holdings;
 pub mod multicall;
@@ -65,7 +66,7 @@ const RETRY: Duration = Duration::from_millis(500);
 const FORWARD_HEADROOM: (u64, u64) = (6, 5);
 
 /// Reads the env var `name`, treating an unset or empty value as missing.
-fn env_var(name: &str) -> Result<String> {
+pub fn env_var(name: &str) -> Result<String> {
   std::env::var(name)
     .ok()
     .filter(|value| !value.trim().is_empty())
@@ -73,7 +74,7 @@ fn env_var(name: &str) -> Result<String> {
 }
 
 /// Parses the address in `text`, naming the config `key` it came from on error.
-fn parse_address(key: &str, text: &str) -> Result<Address> {
+pub fn parse_address(key: &str, text: &str) -> Result<Address> {
   Address::from_str(text).map_err(|e| Error::Config(format!("{key}: {text}: {e}")))
 }
 
