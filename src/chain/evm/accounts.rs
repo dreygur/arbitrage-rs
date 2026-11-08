@@ -28,7 +28,7 @@ fn source_signers(source: &AccountSource) -> Result<Vec<PrivateKeySigner>> {
             .phrase(phrase.trim())
             .index(index)
             .and_then(|builder| builder.build())
-            .map_err(|e| Error::Env(format!("{env}: index {index}: {e}")))
+            .map_err(|_| Error::Env(format!("{env}: index {index}: invalid mnemonic")))
         })
         .collect()
     }
@@ -37,7 +37,7 @@ fn source_signers(source: &AccountSource) -> Result<Vec<PrivateKeySigner>> {
       let signer = key
         .trim()
         .parse::<PrivateKeySigner>()
-        .map_err(|e| Error::Env(format!("{env}: {e}")))?;
+        .map_err(|_| Error::Env(format!("{env}: invalid private key")))?;
       Ok(vec![signer])
     }
   }
@@ -139,5 +139,27 @@ mod tests {
       indices: vec![0],
     }];
     assert!(matches!(signers(&unset), Err(Error::Env(name)) if name == "ARB_TEST_MNEMONIC_UNSET"));
+  }
+
+  /// A bad phrase or key is reported by env var name only, never echoed back.
+  #[test]
+  fn bad_secrets_stay_out_of_errors() {
+    let phrase = "secretword secretword secretword secretword secretword secretword";
+    set("ARB_TEST_MNEMONIC_BAD", phrase);
+    let mnemonic = [AccountSource::Mnemonic {
+      env: "ARB_TEST_MNEMONIC_BAD".into(),
+      indices: vec![3],
+    }];
+    let err = signers(&mnemonic).unwrap_err().to_string();
+    assert_eq!(err, "env: ARB_TEST_MNEMONIC_BAD: index 3: invalid mnemonic");
+    assert!(!err.contains("secretword"), "{err}");
+    let key = "0xsecretkeymaterial00000000000000000000000000000000000000000000ff";
+    set("ARB_TEST_KEY_BAD", key);
+    let source = [AccountSource::Key {
+      env: "ARB_TEST_KEY_BAD".into(),
+    }];
+    let err = signers(&source).unwrap_err().to_string();
+    assert_eq!(err, "env: ARB_TEST_KEY_BAD: invalid private key");
+    assert!(!err.contains("secretkeymaterial"), "{err}");
   }
 }
