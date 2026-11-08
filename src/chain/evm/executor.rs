@@ -1,8 +1,14 @@
 //! Executor lifecycle: reuse the deployed `FlashArbitrage` named in `.arbitrage-<network>.json`
 //! when it still fits the config, otherwise deploy a new one from the owner and record it.
+//!
+//! The deploy and every `setOperator` obey the same gas caps as the engine's transactions:
+//! nothing is sent while the fee per gas is over the cap, each is signed with the engine's fee
+//! cap and tip, and its gas limit never passes `max_gas_limit`.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use serde::{Deserialize, Serialize};
@@ -10,7 +16,11 @@ use tracing::{info, warn};
 
 use crate::chain::evm::bindings::FlashArbitrage;
 use crate::chain::evm::config::EvmConfig;
+use crate::chain::evm::gas::{fee_cap, fee_per_gas, next_base_fee};
 use crate::error::{Error, Result};
+
+/// Gas limit headroom over the node's estimate, as `6 / 5` (20%).
+const HEADROOM: (u64, u64) = (6, 5);
 
 /// The executor a previous run deployed, saved as JSON so the next run can find it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +33,69 @@ pub struct ExecutorRecord {
   pub treasury: Address,
   /// Chain it was deployed on.
   pub chain_id: u64,
+  /// Operators granted by the last run, so one dropped from the config can be revoked;
+  /// empty in a record written before this field existed.
+  #[serde(default)]
+  pub operators: Vec<Address>,
+}
+
+/// The fee cap and tip an owner transaction is signed with when the next base fee is
+/// `next_base_fee`, or an error while the fee per gas is over the cap.
+pub fn setup_fees(next_base_fee: u128, evm: &EvmConfig) -> Result<(u128, u128)> {
+  if fee_per_gas(next_base_fee, evm).is_none() {
+    return Err(Error::Contract(format!(
+      "fee per gas {} over the cap from max_fee_per_gas {}, executor setup not sent",
+      next_base_fee.saturating_add(evm.priority_fee),
+      evm.max_fee_per_gas
+    )));
+  }
+  Ok((fee_cap(next_base_fee, evm), evm.priority_fee))
+}
+
+/// The gas limit for an owner transaction the node estimated at `estimate`: 20% headroom,
+/// capped at `max_gas_limit`, or an error when the estimate alone is above it.
+pub fn setup_gas(estimate: u64, max_gas_limit: u64) -> Result<u64> {
+  if estimate > max_gas_limit {
+    return Err(Error::Contract(format!(
+      "transaction needs {estimate} gas, above max_gas_limit {max_gas_limit}"
+    )));
+  }
+  let padded = u128::from(estimate) * u128::from(HEADROOM.0) / u128::from(HEADROOM.1);
+  Ok(u64::try_from(padded).unwrap_or(u64::MAX).min(max_gas_limit))
+}
+
+/// The `setOperator` calls that bring the contract in line with `configured`: a grant for
+/// each configured operator not in `granted`, and a revoke for each `recorded` operator no
+/// longer configured that still holds the role.
+pub fn operator_changes(
+  recorded: &[Address],
+  configured: &[Address],
+  granted: &HashSet<Address>,
+) -> Vec<(Address, bool)> {
+  let grants = configured
+    .iter()
+    .filter(|op| !granted.contains(*op))
+    .map(|&op| (op, true));
+  let revokes = recorded
+    .iter()
+    .filter(|op| !configured.contains(*op) && granted.contains(*op))
+    .map(|&op| (op, false));
+  grants.chain(revokes).collect()
+}
+
+/// The fee cap and tip for owner transactions sent now, from the latest block's base fee.
+async fn current_fees<P: Provider>(provider: &P, evm: &EvmConfig) -> Result<(u128, u128)> {
+  let block = provider
+    .get_block_by_number(BlockNumberOrTag::Latest)
+    .await?
+    .ok_or_else(|| Error::Rpc("latest block missing".into()))?;
+  let header = &block.header.inner;
+  let next = next_base_fee(
+    header.base_fee_per_gas.map(u128::from).unwrap_or_default(),
+    header.gas_used,
+    header.gas_limit,
+  );
+  setup_fees(next, evm)
 }
 
 /// What `ensure_executor` does about the executor.
@@ -67,8 +140,75 @@ fn read_record(path: &Path) -> Result<Option<ExecutorRecord>> {
   }
 }
 
+/// Writes `record` to `path` as pretty JSON.
+fn write_record(path: &Path, record: &ExecutorRecord) -> Result<()> {
+  std::fs::write(path, serde_json::to_string_pretty(record)?)?;
+  Ok(())
+}
+
+/// Deploys a new executor from the owner within the gas caps, returning its address.
+async fn deploy<P: Provider>(
+  provider: &P,
+  evm: &EvmConfig,
+  weth: Address,
+  treasury: Address,
+  operators: &[Address],
+) -> Result<Address> {
+  let (cap, tip) = current_fees(provider, evm).await?;
+  let builder = FlashArbitrage::deploy_builder(
+    provider,
+    evm.pool_manager,
+    weth,
+    treasury,
+    operators.to_vec(),
+  );
+  let gas = setup_gas(builder.estimate_gas().await?, evm.max_gas_limit)?;
+  let address = builder
+    .gas(gas)
+    .max_fee_per_gas(cap)
+    .max_priority_fee_per_gas(tip)
+    .deploy()
+    .await?;
+  Ok(address)
+}
+
+/// Sends each `setOperator` in `changes` from the owner within the gas caps, waiting for
+/// every receipt.
+async fn apply_operators<P: Provider>(
+  provider: &P,
+  evm: &EvmConfig,
+  executor: Address,
+  changes: &[(Address, bool)],
+) -> Result<()> {
+  if changes.is_empty() {
+    return Ok(());
+  }
+  let (cap, tip) = current_fees(provider, evm).await?;
+  let contract = FlashArbitrage::new(executor, provider);
+  for &(operator, allowed) in changes {
+    let call = contract.setOperator(operator, allowed);
+    let gas = setup_gas(call.estimate_gas().await?, evm.max_gas_limit)?;
+    let receipt = call
+      .gas(gas)
+      .max_fee_per_gas(cap)
+      .max_priority_fee_per_gas(tip)
+      .send()
+      .await?
+      .get_receipt()
+      .await
+      .map_err(|e| Error::Contract(format!("setOperator {operator}: {e}")))?;
+    if !receipt.status() {
+      return Err(Error::Contract(format!("setOperator {operator} reverted")));
+    }
+    info!(%operator, allowed, "operator updated");
+  }
+  Ok(())
+}
+
 /// Returns the executor to trade through, deploying one when the record at `record_path` is
-/// missing or no longer fits, and grants `setOperator` to every operator it lacks.
+/// missing or no longer fits. A reused executor gets `setOperator` for every configured
+/// operator it lacks and a revoke for every recorded operator no longer configured; the
+/// record then lists the configured operators.
 ///
 /// `provider` must send from `owner`, which becomes the owner of a new deployment. A corrupt
 /// record is an error rather than a redeploy, so an executor still holding profit is not
@@ -87,59 +227,56 @@ pub async fn ensure_executor<P: Provider>(
     Some(record) => !provider.get_code_at(record.address).await?.is_empty(),
     None => false,
   };
-  let address = match executor_action(record.as_ref(), code_present, owner, treasury, evm.chain_id)
-  {
+  let fresh = |address| ExecutorRecord {
+    address,
+    owner,
+    treasury,
+    chain_id: evm.chain_id,
+    operators: operators.to_vec(),
+  };
+  match executor_action(record.as_ref(), code_present, owner, treasury, evm.chain_id) {
     ExecutorAction::Reuse(address) => {
       info!(%address, "reusing executor");
-      address
+      let recorded = record.map(|r| r.operators).unwrap_or_default();
+      let contract = FlashArbitrage::new(address, provider);
+      let mut granted = HashSet::new();
+      let known: BTreeSet<Address> = operators.iter().chain(&recorded).copied().collect();
+      for operator in known {
+        if contract.operators(operator).call().await? {
+          granted.insert(operator);
+        }
+      }
+      let changes = operator_changes(&recorded, operators, &granted);
+      apply_operators(provider, evm, address, &changes).await?;
+      if recorded != operators {
+        write_record(record_path, &fresh(address))?;
+      }
+      Ok(address)
     }
     ExecutorAction::Deploy => {
       if let Some(record) = &record {
         warn!(old = %record.address, "recorded executor does not fit the config, deploying a new one");
       }
-      let address = FlashArbitrage::deploy_builder(
-        provider,
-        evm.pool_manager,
-        weth,
-        treasury,
-        operators.to_vec(),
-      )
-      .deploy()
-      .await?;
-      let record = ExecutorRecord {
-        address,
-        owner,
-        treasury,
-        chain_id: evm.chain_id,
-      };
-      std::fs::write(record_path, serde_json::to_string_pretty(&record)?)?;
+      let address = deploy(provider, evm, weth, treasury, operators).await?;
+      write_record(record_path, &fresh(address))?;
       info!(%address, "deployed executor");
-      address
+      Ok(address)
     }
-  };
-  let contract = FlashArbitrage::new(address, provider);
-  for &operator in operators {
-    if contract.operators(operator).call().await? {
-      continue;
-    }
-    let receipt = contract
-      .setOperator(operator, true)
-      .send()
-      .await?
-      .get_receipt()
-      .await
-      .map_err(|e| Error::Contract(format!("setOperator {operator}: {e}")))?;
-    if !receipt.status() {
-      return Err(Error::Contract(format!("setOperator {operator} reverted")));
-    }
-    info!(%operator, "granted operator");
   }
-  Ok(address)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  use alloy::primitives::Bytes;
+  use alloy::providers::mock::Asserter;
+  use alloy::sol_types::SolCall;
+
+  use crate::testkit::{mock_evm_config, mock_provider};
+
+  /// One gwei in wei.
+  const GWEI: u128 = 1_000_000_000;
 
   /// The configured owner.
   fn owner() -> Address {
@@ -158,7 +295,82 @@ mod tests {
       owner: owner(),
       treasury: treasury(),
       chain_id: 1,
+      operators: vec![operator(2)],
     }
+  }
+
+  /// Operator `n`.
+  fn operator(n: u8) -> Address {
+    Address::repeat_byte(n)
+  }
+
+  /// Over the fee cap nothing is sent; under it the engine's fee cap and the tip are used.
+  #[test]
+  fn setup_fees_obey_cap() {
+    let evm = mock_evm_config();
+    assert!(matches!(
+      setup_fees(45 * GWEI, &evm),
+      Err(Error::Contract(_))
+    ));
+    assert_eq!(
+      setup_fees(10 * GWEI, &evm).unwrap(),
+      (fee_cap(10 * GWEI, &evm), evm.priority_fee)
+    );
+  }
+
+  /// The gas limit pads the estimate by 20% but never passes `max_gas_limit`, and an estimate
+  /// above it is refused.
+  #[test]
+  fn setup_gas_capped() {
+    assert_eq!(setup_gas(100_000, 1_000_000).unwrap(), 120_000);
+    assert_eq!(setup_gas(900_000, 1_000_000).unwrap(), 1_000_000);
+    assert!(matches!(
+      setup_gas(1_370_687, 1_000_000),
+      Err(Error::Contract(_))
+    ));
+  }
+
+  /// New operators are granted, dropped ones still holding the role are revoked, and
+  /// operators already in place are left alone.
+  #[test]
+  fn operator_changes_grant_and_revoke() {
+    let granted = HashSet::from([operator(2), operator(3), operator(4)]);
+    let recorded = [operator(2), operator(3), operator(5)];
+    let configured = [operator(2), operator(6)];
+    assert_eq!(
+      operator_changes(&recorded, &configured, &granted),
+      vec![(operator(6), true), (operator(3), false)]
+    );
+    let in_place = HashSet::from(configured);
+    assert!(operator_changes(&configured, &configured, &in_place).is_empty());
+  }
+
+  /// A reused executor whose operators all match sends no transaction and keeps its record.
+  #[tokio::test]
+  async fn reuse_with_operators_in_place_sends_nothing() {
+    let dir = std::env::temp_dir().join(format!("executor-reuse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(".arbitrage-test.json");
+    write_record(&path, &record()).unwrap();
+    let asserter = Asserter::new();
+    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    asserter.push_success(&Bytes::from(
+      FlashArbitrage::operatorsCall::abi_encode_returns(&true),
+    ));
+    let address = ensure_executor(
+      &mock_provider(&asserter),
+      &path,
+      &mock_evm_config(),
+      Address::repeat_byte(0xee),
+      treasury(),
+      owner(),
+      &[operator(2)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(address, record().address);
+    assert!(asserter.read_q().is_empty(), "unexpected calls");
+    assert_eq!(read_record(&path).unwrap(), Some(record()));
   }
 
   /// A record survives a trip through its JSON file.
