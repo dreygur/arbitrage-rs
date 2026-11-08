@@ -92,7 +92,8 @@ async fn transfer_from_whale<P: Provider>(
 }
 
 /// Gives `account` the token's configured amount, by writing storage and, when the node cannot,
-/// by a transfer from the token's whale.
+/// by a transfer from the token's whale. The first sets the balance while the second adds to
+/// it, so a rerun is idempotent only on the first path.
 async fn give_token<P: Provider>(provider: &P, account: Address, token: &ForkToken) -> Result<()> {
   let dealt = provider
     .raw_request::<_, Value>(DEAL_ERC20.into(), (account, token.address, token.amount))
@@ -166,6 +167,9 @@ mod tests {
 
   use crate::testkit::mock_provider;
 
+  /// Requests the default fillers make before a transaction send fails on the first error.
+  const FILLER_REQUESTS: usize = 1;
+
   /// A fork section that funds one ETH and no tokens.
   fn fork() -> ForkSection {
     ForkSection {
@@ -209,6 +213,52 @@ mod tests {
       .await
       .unwrap();
     assert!(asserter.read_q().is_empty(), "setCode was not called");
+  }
+
+  /// One account with no tokens is funded in order: guard, treasury code, account code,
+  /// balance set, balance read. A response of the wrong shape would fail the read.
+  #[tokio::test]
+  async fn funds_one_account_in_order() {
+    let asserter = Asserter::new();
+    asserter.push_success(&serde_json::json!({}));
+    asserter.push_success(&Bytes::new());
+    asserter.push_success(&Bytes::new());
+    asserter.push_success(&Value::Null);
+    asserter.push_success(&fork().fund_eth);
+    let account = Address::repeat_byte(0x01);
+    let funded = fund(&mock_provider(&asserter), &fork(), treasury(), &[account])
+      .await
+      .unwrap();
+    assert_eq!(funded.len(), 1);
+    assert_eq!(funded[0].address, account);
+    assert_eq!(funded[0].eth, fork().fund_eth);
+    assert!(asserter.read_q().is_empty());
+  }
+
+  /// When `anvil_dealERC20` fails and the whale transfer then fails, the whale is still
+  /// released and the transfer error is returned.
+  #[tokio::test]
+  async fn whale_fallback_stops_impersonating_after_failed_transfer() {
+    let asserter = Asserter::new();
+    asserter.push_failure_msg("dealERC20 unsupported");
+    asserter.push_success(&Value::Null);
+    for _ in 0..FILLER_REQUESTS {
+      asserter.push_failure_msg("transfer failed");
+    }
+    asserter.push_success(&Value::Null);
+    let token = ForkToken {
+      address: Address::repeat_byte(0x0a),
+      amount: Amount::from(5u64),
+      whale: Address::repeat_byte(0x0b),
+    };
+    let result = give_token(
+      &mock_provider(&asserter),
+      Address::repeat_byte(0x01),
+      &token,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(asserter.read_q().is_empty(), "stop was not called");
   }
 
   /// A treasury with no code is left alone.

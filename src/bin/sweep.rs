@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use alloy::network::EthereumWallet;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use arbitrage::chain::evm::accounts::signers;
 use arbitrage::chain::evm::bindings::{FlashArbitrage, IERC20};
 use arbitrage::chain::evm::config::EvmConfig;
@@ -43,6 +43,15 @@ async fn main() -> eyre::Result<()> {
     .wallet(EthereumWallet::from(owner))
     .connect(&env_var("RPC_URL")?)
     .await?;
+  if provider.get_code_at(record.address).await?.is_empty() {
+    return Err(
+      Error::Contract(format!(
+        "executor in {} has no code; run the bot to deploy",
+        path.display()
+      ))
+      .into(),
+    );
+  }
   let held = IERC20::new(weth, &provider)
     .balanceOf(record.address)
     .call()

@@ -1,12 +1,10 @@
 //! Funds the configured accounts on an anvil fork with ETH and the configured tokens.
 
-use std::str::FromStr;
-
 use alloy::providers::ProviderBuilder;
 use arbitrage::chain::evm::accounts::signers;
 use arbitrage::chain::evm::config::EvmConfig;
-use arbitrage::chain::evm::env_var;
 use arbitrage::chain::evm::fund::fund;
+use arbitrage::chain::evm::{env_var, parse_address};
 use arbitrage::config::NetworkConfig;
 use arbitrage::error::Error;
 use tracing::info;
@@ -29,8 +27,7 @@ async fn main() -> eyre::Result<()> {
     .fork
     .as_ref()
     .ok_or_else(|| Error::Config("adapter.fork: missing, nothing to fund".into()))?;
-  let treasury = alloy::primitives::Address::from_str(&cfg.treasury)
-    .map_err(|e| Error::Config(format!("treasury: {e}")))?;
+  let treasury = parse_address("treasury", &cfg.treasury)?;
   let accounts: Vec<_> = signers(&cfg.accounts)?
     .iter()
     .map(|signer| signer.address())
