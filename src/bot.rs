@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tracing::{Instrument, info_span, warn};
+use tracing::{Instrument, error, info_span, warn};
 
 use crate::chain::Chain;
 use crate::config::Live;
@@ -41,6 +41,14 @@ pub struct Decision {
   pub buy: Arc<dyn Venue>,
   /// Venue where the non base token is sold.
   pub sell: Arc<dyn Venue>,
+}
+
+/// Whether two opportunities describe the same trade, ignoring the floor.
+fn same_op(a: &Opportunity, b: &Opportunity) -> bool {
+  a.buy_pool == b.buy_pool
+    && a.sell_pool == b.sell_pool
+    && a.token == b.token
+    && a.amount == b.amount
 }
 
 /// Why a priced opportunity is not sent, or `None` when it passes every check.
@@ -143,7 +151,7 @@ impl<C: Chain> Bot<C> {
           sell,
         }),
         Evaluation::Found { mut op, buy, sell } => {
-          let cost = self.chain.cost(&op);
+          let cost = if paused { None } else { self.chain.cost(&op) };
           let verdict = if paused {
             Some(Verdict::Paused)
           } else {
@@ -162,13 +170,18 @@ impl<C: Chain> Bot<C> {
       Vec::new()
     } else {
       self.chain.submit(to_send).await
-    }
-    .into_iter();
+    };
     let mut results = Vec::new();
     for (op, cost, verdict, buy, sell) in pending {
       let verdict = match verdict {
         Some(verdict) => verdict,
-        None => sent.next().map_or(Verdict::Sent, |(_, verdict)| verdict),
+        None => match sent.iter().position(|(sent_op, _)| same_op(sent_op, &op)) {
+          Some(index) => sent.remove(index).1,
+          None => {
+            error!(buy_pool = %op.buy_pool, sell_pool = %op.sell_pool, "chain returned no verdict for a submitted opportunity");
+            continue;
+          }
+        },
       };
       self.report(Decision {
         block,
@@ -179,6 +192,9 @@ impl<C: Chain> Bot<C> {
         sell,
       });
       results.push((op, verdict));
+    }
+    for (op, _) in sent {
+      error!(buy_pool = %op.buy_pool, sell_pool = %op.sell_pool, "chain returned a verdict for an opportunity that was not submitted");
     }
     results
   }
@@ -410,6 +426,95 @@ mod tests {
     assert_eq!(
       *chain.controls.lock().unwrap(),
       vec![Control::Pause, Control::Resume]
+    );
+  }
+
+  /// Two passing pairs for batch tests: `other` on pools a and b, `third` on c and d.
+  fn two_pairs() -> Vec<Arc<dyn Venue>> {
+    let mut venues = pair();
+    venues.push(venue("c", "third", 24_000));
+    venues.push(venue("d", "third", 20_000));
+    venues
+  }
+
+  /// Verdicts returned out of order still land on their own trades.
+  #[tokio::test]
+  async fn reordered_verdicts_match_by_op() {
+    let (bot, chain, mut rx) = setup(two_pairs(), live(10, u64::MAX), 8);
+    let first = bot.step(1, None).await;
+    let best = first[0].0.token.clone();
+    drain(&mut rx);
+    chain.submits.lock().unwrap().clear();
+    chain.push_reply(vec![(1, Verdict::Locked(7)), (0, Verdict::Sent)]);
+    let results = bot.step(2, None).await;
+    let submitted = chain.submits.lock().unwrap()[0].clone();
+    assert_eq!(submitted[0].token, best);
+    assert_eq!(results.len(), 2);
+    for (op, verdict) in &results {
+      let want = if op.token == best {
+        Verdict::Sent
+      } else {
+        Verdict::Locked(7)
+      };
+      assert_eq!(*verdict, want);
+    }
+    assert_eq!(drain(&mut rx).len(), 2);
+  }
+
+  /// A trade the chain gave no verdict for is neither reported nor called sent.
+  #[tokio::test]
+  async fn missing_verdict_is_not_reported_sent() {
+    let (bot, chain, mut rx) = setup(two_pairs(), live(10, u64::MAX), 8);
+    chain.push_reply(vec![(0, Verdict::Locked(3))]);
+    let results = bot.step(1, None).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].1, Verdict::Locked(3));
+    let decisions = drain(&mut rx);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].verdict, Verdict::Locked(3));
+  }
+
+  /// The quoted profit of the sample pair.
+  async fn sample_profit() -> Amount {
+    let (bot, _chain, _rx) = setup(pair(), live(u64::MAX / 2, u64::MAX), 8);
+    bot.step(1, None).await[0].0.profit
+  }
+
+  /// Profit equal to the cost does not pay for gas.
+  #[tokio::test]
+  async fn profit_equal_to_cost_exceeds() {
+    let profit = sample_profit().await;
+    let (bot, chain, _rx) = setup(pair(), live(0, u64::MAX), 8);
+    chain.set_cost("a", Some(profit));
+    assert_eq!(bot.step(1, None).await[0].1, Verdict::GasExceedsProfit);
+  }
+
+  /// Profit equal to cost plus the minimum is still below the minimum.
+  #[tokio::test]
+  async fn profit_equal_to_cost_plus_min_is_below_min() {
+    let profit = sample_profit().await.to::<u64>();
+    let (bot, chain, _rx) = setup(pair(), live(profit - 5, u64::MAX), 8);
+    chain.set_cost("a", Some(Amount::from(5u64)));
+    assert_eq!(bot.step(1, None).await[0].1, Verdict::BelowMin);
+  }
+
+  /// A cost exactly at `max_gas_cost` is allowed.
+  #[tokio::test]
+  async fn cost_equal_to_max_gas_cost_is_allowed() {
+    let (bot, chain, _rx) = setup(pair(), live(10, 5), 8);
+    chain.set_cost("a", Some(Amount::from(5u64)));
+    assert_eq!(bot.step(1, None).await[0].1, Verdict::Sent);
+  }
+
+  /// A paused bot never asks the chain for a cost.
+  #[tokio::test]
+  async fn paused_skips_cost() {
+    let (bot, chain, _rx) = setup(pair(), live(10, u64::MAX), 8);
+    bot.set_paused(true);
+    bot.step(1, None).await;
+    assert_eq!(
+      chain.cost_calls.load(std::sync::atomic::Ordering::SeqCst),
+      0
     );
   }
 }

@@ -94,8 +94,13 @@ pub struct MockChain {
   costs: Mutex<HashMap<Id, Option<Amount>>>,
   /// Verdict returned for every submitted opportunity.
   verdict: Mutex<Verdict>,
+  /// Scripted replies, one per `submit` call, front first. Each entry pairs an index into the
+  /// submitted batch with its verdict, in the order returned; omitted indices get no reply.
+  replies: Mutex<VecDeque<Vec<(usize, Verdict)>>>,
   /// Every batch passed to `submit`.
   pub submits: Mutex<Vec<Vec<Opportunity>>>,
+  /// Number of `cost` calls.
+  pub cost_calls: AtomicUsize,
   /// Every command passed to `control`.
   pub controls: Mutex<Vec<Control>>,
   /// Value returned by `in_flight`.
@@ -113,7 +118,9 @@ impl MockChain {
       updates: Mutex::new(VecDeque::new()),
       costs: Mutex::new(HashMap::new()),
       verdict: Mutex::new(Verdict::Sent),
+      replies: Mutex::new(VecDeque::new()),
       submits: Mutex::new(Vec::new()),
+      cost_calls: AtomicUsize::new(0),
       controls: Mutex::new(Vec::new()),
       in_flight: AtomicUsize::new(0),
       status: Mutex::new(Status {
@@ -142,7 +149,12 @@ impl MockChain {
     self.costs.lock().unwrap().insert(pool, cost);
   }
 
-  /// Sets the verdict `submit` returns for every opportunity.
+  /// Queues the reply of the next unanswered `submit` call as `(batch index, verdict)` pairs.
+  pub fn push_reply(&self, reply: Vec<(usize, Verdict)>) {
+    self.replies.lock().unwrap().push_back(reply);
+  }
+
+  /// Sets the fallback verdict `submit` returns for every opportunity when no reply is queued.
   pub fn set_verdict(&self, verdict: Verdict) {
     *self.verdict.lock().unwrap() = verdict;
   }
@@ -162,6 +174,7 @@ impl Chain for MockChain {
 
   /// Returns the scripted cost of the buy pool, zero when none is set.
   fn cost(&self, op: &Opportunity) -> Option<Amount> {
+    self.cost_calls.fetch_add(1, Ordering::SeqCst);
     let costs = self.costs.lock().unwrap();
     costs
       .get(&op.buy_pool)
@@ -172,6 +185,12 @@ impl Chain for MockChain {
   /// Records the batch and answers every opportunity with the scripted verdict.
   async fn submit(&self, ops: Vec<Opportunity>) -> Vec<(Opportunity, Verdict)> {
     self.submits.lock().unwrap().push(ops.clone());
+    if let Some(reply) = self.replies.lock().unwrap().pop_front() {
+      return reply
+        .into_iter()
+        .map(|(index, verdict)| (ops[index].clone(), verdict))
+        .collect();
+    }
     let verdict = *self.verdict.lock().unwrap();
     ops.into_iter().map(|op| (op, verdict)).collect()
   }

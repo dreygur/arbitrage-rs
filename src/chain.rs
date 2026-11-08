@@ -19,7 +19,7 @@ pub trait Chain: Send + Sync {
   /// Gas cost of `op` in base token units, or `None` when the fee cap is exceeded.
   fn cost(&self, op: &Opportunity) -> Option<Amount>;
 
-  /// Sends the opportunities, best first, and returns one verdict per input in the same order.
+  /// Sends the opportunities, best first, and returns a verdict for each input, in any order, paired with the opportunity it concerns.
   async fn submit(&self, ops: Vec<Opportunity>) -> Vec<(Opportunity, Verdict)>;
 
   /// Applies new live settings in place.
