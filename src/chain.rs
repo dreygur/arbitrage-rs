@@ -7,6 +7,8 @@ use crate::error::Result;
 use crate::types::{Amount, Control, Id, Opportunity, Status, Update, Verdict};
 use crate::venue::Venue;
 
+pub mod evm;
+
 /// A network the bot reads state from and sends trades to.
 #[allow(async_fn_in_trait)]
 pub trait Chain: Send + Sync {
