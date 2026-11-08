@@ -678,6 +678,11 @@ impl<P: Provider> Engine<P> {
   /// Sends every planned entry in id order, so each lane's nonces are consecutive, then
   /// journals them. Journaling after the whole batch keeps the sends back to back, at the
   /// price that a crash between a send and the journal write loses those lines.
+  ///
+  /// Accepted delay: lanes interleave in id order, so after a rejected send on one lane,
+  /// that lane's next entry resyncs inline and any later entry of another lane in the batch
+  /// waits behind that one nonce read. It takes a failed send and two or more trades on a
+  /// lane in one batch; reordering the batch around it is not worth the complexity.
   async fn send_planned(&mut self) {
     let mut events = Vec::new();
     for index in 0..self.pending.len() {
@@ -698,15 +703,18 @@ impl<P: Provider> Engine<P> {
       .retain(|p| !(p.finished() && p.mined_block.is_none_or(|mined| applied >= mined)));
   }
 
-  /// The receipt of `tx`, `None` while unmined or when the read fails.
-  async fn receipt(&self, tx: B256) -> Option<TransactionReceipt> {
-    match self.provider.get_transaction_receipt(tx).await {
-      Ok(receipt) => receipt,
-      Err(e) => {
+  /// The receipt of `tx`, `Ok(None)` while unmined. A failed read is an error, never taken
+  /// for "not mined", since a lagging or failing backend would then let a mined entry look
+  /// replaced.
+  async fn receipt(&self, tx: B256) -> Result<Option<TransactionReceipt>> {
+    self
+      .provider
+      .get_transaction_receipt(tx)
+      .await
+      .map_err(|e| {
         warn!(%tx, error = %e, "receipt read failed");
-        None
-      }
-    }
+        Error::from(e)
+      })
   }
 
   /// Settles the entry at `index` from its own receipt, teaching the gas limits and the
@@ -805,19 +813,24 @@ impl<P: Provider> Engine<P> {
   }
 
   /// Settles whether the unconfirmed entry at `index` reached the node: known by hash, it
-  /// is followed like any sent entry; unknown while the lane's pending nonce has not passed
-  /// its nonce, it never got there and is dropped; otherwise the next block asks again.
+  /// is followed like any sent entry. It is dropped as never received only once
+  /// `trade_timeout` blocks have passed since it was sent, its hash is still unknown and the
+  /// lane's pending nonce has not passed its nonce. Before that an unknown hash may be node
+  /// lag or slow propagation, so it stays `Sent` with its locks held and the next block asks
+  /// again.
   async fn confirm(&mut self, index: usize) -> Vec<TradeEvent> {
     let p = &self.pending[index];
     let (Some(tx), lane, nonce) = (p.tx, p.lane, p.nonce) else {
       return Vec::new();
     };
+    let timed_out = self.block.saturating_sub(p.sent_block) > self.live.trade_timeout;
     match self.provider.get_transaction_by_hash(tx).await {
       Ok(Some(_)) => {
         self.pending[index].unconfirmed = false;
         return Vec::new();
       }
-      Ok(None) => {}
+      Ok(None) if timed_out => {}
+      Ok(None) => return Vec::new(),
       Err(e) => {
         warn!(%tx, error = %e, "transaction read failed");
         return Vec::new();
@@ -842,7 +855,8 @@ impl<P: Provider> Engine<P> {
   /// An entry with neither receipt that is unconfirmed or past `trade_timeout` has its
   /// lane's nonce read at this block (once per lane): a nonce past the entry's means another
   /// transaction took it, which no receipt we follow will ever show. An unconfirmed entry
-  /// still holding its nonce is then checked by hash.
+  /// still holding its nonce is then checked by hash. In a block where a receipt read for
+  /// the entry or its cancel failed, neither check runs; the next block reads again.
   async fn check_receipts(&mut self) {
     let mut used_nonces: HashMap<usize, Option<u64>> = HashMap::new();
     let mut events = Vec::new();
@@ -854,14 +868,23 @@ impl<P: Provider> Engine<P> {
       let (Some(tx), cancel) = (p.tx, p.cancel.as_ref().map(|cancel| cancel.tx)) else {
         continue;
       };
-      if let Some(receipt) = self.receipt(tx).await {
+      let original = self.receipt(tx).await;
+      if let Ok(Some(receipt)) = original {
         self.finish(index, receipt).await;
         continue;
       }
-      if let Some(cancel) = cancel
-        && let Some(receipt) = self.receipt(cancel).await
-      {
-        self.cancelled(index, receipt).await;
+      let mut unread = original.is_err();
+      if let Some(cancel) = cancel {
+        match self.receipt(cancel).await {
+          Ok(Some(receipt)) => {
+            self.cancelled(index, receipt).await;
+            continue;
+          }
+          Ok(None) => {}
+          Err(_) => unread = true,
+        }
+      }
+      if unread {
         continue;
       }
       let p = &self.pending[index];
@@ -2088,9 +2111,9 @@ mod tests {
     push_unmined(&f.asserter);
     push_nonce(&f.asserter, 0);
     push_unmined(&f.asserter);
-    push_nonce(&f.asserter, 1);
-    push_balances(&f.asserter, 3, ETH);
+    push_balances(&f.asserter, 3, 2 * ETH);
     f.engine.on_block(head(11), 11).await;
+    assert_eq!(f.engine.lanes[1].eth, wei(2 * ETH), "reads out of order");
     assert_eq!(f.engine.pending[0].state, TradeState::Sent);
     assert_eq!(
       f.engine.accept(vec![op(1, 3, 9)], 11)[0].1,
@@ -2111,8 +2134,9 @@ mod tests {
     assert!(f.asserter.read_q().is_empty());
   }
 
-  /// An ambiguous send the node does not know, with the lane's pending nonce not past it,
-  /// is dropped and its locks released.
+  /// An ambiguous send the node does not know is kept, locks held, while the node may only
+  /// be lagging; once `trade_timeout` blocks pass with the hash still unknown and the lane's
+  /// pending nonce not past it, it is dropped and its locks released.
   #[tokio::test]
   async fn unknown_ambiguous_send_dropped() {
     let mut f = fixture("ambiguous-lost", 3, 16).await;
@@ -2123,13 +2147,56 @@ mod tests {
     push_unmined(&f.asserter);
     push_nonce(&f.asserter, 0);
     push_unmined(&f.asserter);
+    push_balances(&f.asserter, 3, 2 * ETH);
+    f.engine.on_block(head(11), 11).await;
+    assert_eq!(f.engine.lanes[1].eth, wei(2 * ETH), "reads out of order");
+    assert_eq!(f.engine.pending[0].state, TradeState::Sent);
+    assert_eq!(
+      f.engine.accept(vec![op(1, 3, 9)], 11)[0].1,
+      Verdict::Locked(1)
+    );
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_unmined(&f.asserter);
     push_nonce(&f.asserter, 0);
     push_balances(&f.asserter, 3, ETH);
-    f.engine.on_block(head(11), 11).await;
+    f.engine.on_block(head(14), 14).await;
     assert!(f.engine.pending.is_empty());
     assert_eq!(f.engine.lanes[1].nonce, None);
     assert!(drain(&mut f.events).contains(&(1, EntryKind::Trade, TradeState::Dropped)));
-    assert_eq!(f.engine.accept(vec![op(1, 3, 9)], 11)[0].1, Verdict::Sent);
+    assert_eq!(f.engine.accept(vec![op(1, 3, 9)], 14)[0].1, Verdict::Sent);
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// A failed receipt read is not taken for "not mined": in that block a used nonce does
+  /// not drop the entry, and the next block's receipt settles it as executed.
+  #[tokio::test]
+  async fn failed_receipt_read_defers_replaced() {
+    let mut f = fixture("receipt-error", 2, 32).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_sent(&f.asserter);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(14), 14).await;
+    assert!(f.engine.pending[0].cancel.is_some());
+    f.asserter.push_failure_msg("header not found");
+    push_unmined(&f.asserter);
+    push_sent(&f.asserter);
+    push_balances(&f.asserter, 2, 2 * ETH);
+    f.engine.on_block(head(15), 15).await;
+    assert_eq!(f.engine.lanes[1].eth, wei(2 * ETH), "reads out of order");
+    assert_eq!(f.engine.pending[0].state, TradeState::Sent);
+    push_mined(&f.asserter, 15, true, 200_000);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(16), 16).await;
+    assert!(f.engine.pending.is_empty());
+    let events = drain(&mut f.events);
+    assert!(events.contains(&(1, EntryKind::Trade, TradeState::Executed)));
+    assert!(events.contains(&(1, EntryKind::Cancel, TradeState::Dropped)));
+    assert!(!events.contains(&(1, EntryKind::Trade, TradeState::Dropped)));
     assert!(f.asserter.read_q().is_empty());
   }
 
