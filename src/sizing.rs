@@ -19,6 +19,7 @@ pub fn gain(buy: &dyn Venue, sell: &dyn Venue, base: &Id, x: Amount) -> Result<O
     Side::OneForZero => token0,
   };
   let sell_side = side_for(sell, other)?;
+  // Validates that the sell pool holds base, so its pair is exactly {base, other}.
   side_for(sell, base)?;
   let bought = buy.quote_out(x, buy_side)?;
   let back = sell.quote_out(bought, sell_side)?;

@@ -111,9 +111,18 @@ fn evaluate_group(group: &[Arc<dyn Venue>], base: &Id, max_trade: Amount) -> Opt
             best = Some((op, buy, sell));
           }
         }
-        _ => {
-          if failure.is_none() {
+        Ok(None) => {
+          if best.is_none() && failure.is_none() {
             failure = size_one_failure(a, b, base);
+          }
+        }
+        Err(error) => {
+          if failure.is_none() {
+            failure = Some(Evaluation::Failed {
+              buy: a.clone(),
+              sell: b.clone(),
+              error,
+            });
           }
         }
       }
@@ -209,7 +218,10 @@ mod tests {
     assert_eq!(op.sell_pool, id("b"));
     assert_eq!(op.token, id("other"));
     assert_eq!(op.floor, Amount::ZERO);
-    assert_eq!(gain(&a, &b, &base(), op.amount).unwrap(), Some(op.profit));
+    let x = op.amount.to::<u128>();
+    let bought = x * 9970 * 25_000 / (10_000 * 10_000 + x * 9970);
+    let back = bought * 9970 * 10_000 / (20_000 * 10_000 + bought * 9970);
+    assert_eq!(op.profit, Amount::from(back - x));
   }
 
   /// Swapping the imbalance flips the direction.
@@ -305,12 +317,11 @@ mod tests {
     let venues = vec![venue("x1", "x", 25_000), Arc::new(broken)];
     let out = find_all(&venues, &base(), Amount::from(10_000u64), None);
     assert_eq!(out.len(), 1);
-    assert!(matches!(
-      &out[0],
-      Evaluation::Failed {
-        error: Error::InsufficientLiquidity,
-        ..
-      }
-    ));
+    let Evaluation::Failed { buy, sell, error } = &out[0] else {
+      panic!("expected Failed");
+    };
+    assert!(matches!(error, Error::InsufficientLiquidity));
+    assert_eq!(buy.pool(), &id("x1"));
+    assert_eq!(sell.pool(), &id("x2"));
   }
 }
