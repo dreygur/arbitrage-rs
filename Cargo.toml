@@ -36,3 +36,8 @@ opt-level = 3
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+[[bench]]
+name = "step"
+harness = false
+required-features = ["testkit"]
