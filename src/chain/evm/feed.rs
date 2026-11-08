@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256};
@@ -45,6 +45,10 @@ pub struct FeedBlock {
   pub gas_used: u64,
   /// Gas limit of the block.
   pub gas_limit: u64,
+  /// Block timestamp in Unix seconds, against which the feed lag is measured.
+  pub timestamp: u64,
+  /// When the feed saw the head, where a trade's latency stages start.
+  pub seen: Instant,
   /// Logs of tracked pools, as the node returned them.
   pub logs: Vec<Log>,
   /// Whether blocks may have been missed or replaced (a reconnect, a number that does not
@@ -113,6 +117,12 @@ impl FeedHandle {
     (handle, receiver)
   }
 
+  /// A handle with no feed behind it, for tests that drive the bot's side alone.
+  #[cfg(test)]
+  pub(crate) fn detached() -> Self {
+    Self::new().0
+  }
+
   /// Asks for the tick window `request` describes for pool `id`, delivered later as
   /// `FeedEvent::Window`. A pool already waiting for one is not asked for twice.
   pub fn refetch(&self, id: Id, request: WindowRequest) {
@@ -164,6 +174,7 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
   /// A failed or timed out fetch skips the block; the next one then counts as a gap. Returns
   /// false once the bot is gone.
   async fn on_head(&mut self, header: Header) -> bool {
+    let seen = Instant::now();
     let number = header.inner.number;
     let hash = header.hash;
     let filter = Filter::new()
@@ -195,6 +206,8 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
         .unwrap_or_default(),
       gas_used: header.inner.gas_used,
       gas_limit: header.inner.gas_limit,
+      timestamp: header.inner.timestamp,
+      seen,
       logs: logs
         .into_iter()
         .filter(|log| wanted(log, &self.v4_ids))

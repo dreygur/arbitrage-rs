@@ -466,6 +466,12 @@ impl State {
   pub fn snapshots(&self) -> Vec<Arc<dyn Venue>> {
     self.entries.iter().map(|e| e.snapshot.venue()).collect()
   }
+
+  /// The block the state is current at, which the engine needs before it frees a trade's
+  /// locks.
+  pub fn block(&self) -> u64 {
+    self.block
+  }
 }
 
 #[cfg(test)]
@@ -648,6 +654,8 @@ mod tests {
       base_fee: 0,
       gas_used: 0,
       gas_limit: 0,
+      timestamp: 0,
+      seen: std::time::Instant::now(),
       logs: logs.to_vec(),
       gap: false,
     })
@@ -894,6 +902,8 @@ mod tests {
       base_fee: 0,
       gas_used: 0,
       gas_limit: 0,
+      timestamp: 0,
+      seen: std::time::Instant::now(),
       logs: vec![sync(5, 7, 0)],
       gap: true,
     });

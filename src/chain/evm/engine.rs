@@ -6,6 +6,7 @@
 //! breakers and the holding limits, and journals every state change.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::{BlockId, Encodable2718};
@@ -48,6 +49,43 @@ const SWEEP_GAS: u64 = 100_000;
 /// transaction.
 const KNOWN_REPLIES: [&str; 3] = ["already known", "known transaction", "already imported"];
 
+/// When the block behind a decision reached the bot and when the bot decided, the start of
+/// a trade's latency stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timing {
+  /// The feed saw the block's head.
+  pub seen: Instant,
+  /// The bot read the block, its logs fetched.
+  pub read: Instant,
+  /// The bot submitted the trades it decided on.
+  pub decided: Instant,
+}
+
+/// What the chain knows about a submit that the engine cannot, journaled with each trade.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubmitNote {
+  /// `describe` text of the batch's pools at decision time, by pool id.
+  pub describe: HashMap<Id, String>,
+  /// Latency start points; `None` for a step no block drove, such as the first one.
+  pub timing: Option<Timing>,
+}
+
+/// Whole microseconds from `start` to `end`, zero when `end` is earlier.
+fn micros(start: Instant, end: Instant) -> u64 {
+  u64::try_from(end.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Latency stages of a trade as microseconds since the feed saw its block: block read,
+/// decided, signed and sent.
+fn latency(timing: &Timing, signed: Instant, sent: Instant) -> [u64; 4] {
+  [
+    micros(timing.seen, timing.read),
+    micros(timing.seen, timing.decided),
+    micros(timing.seen, signed),
+    micros(timing.seen, sent),
+  ]
+}
+
 /// A request to the engine task.
 #[derive(Debug)]
 pub enum EngineCmd {
@@ -55,6 +93,8 @@ pub enum EngineCmd {
   Submit {
     /// The opportunities, as the bot priced them.
     ops: Vec<Opportunity>,
+    /// Pool descriptions and timing for the journal.
+    note: SubmitNote,
     /// Gets every op back unchanged with its verdict.
     reply: oneshot::Sender<Vec<(Opportunity, Verdict)>>,
   },
@@ -102,6 +142,12 @@ struct TradeInfo {
   op: Opportunity,
   /// Family pair index into the gas limits.
   pair: usize,
+  /// `describe` text of the buy and the sell pool at decision time.
+  describe: [Option<String>; 2],
+  /// Where its latency stages start, when a block drove the decision.
+  timing: Option<Timing>,
+  /// Latency stages, set once it is sent.
+  latency: Option<[u64; 4]>,
 }
 
 /// A zero value self transfer replacing a stuck transaction at its nonce.
@@ -520,6 +566,9 @@ impl<P: Provider> Engine<P> {
       trade: Some(TradeInfo {
         op: op.clone(),
         pair,
+        describe: [None, None],
+        timing: None,
+        latency: None,
       }),
       cancel: None,
       unconfirmed: false,
@@ -546,6 +595,21 @@ impl<P: Provider> Engine<P> {
       .collect()
   }
 
+  /// Attaches `note` to every trade still planned, which right after `accept` is exactly the
+  /// trades that batch accepted, since every send pass leaves nothing planned.
+  fn annotate(&mut self, note: &SubmitNote) {
+    for p in &mut self.pending {
+      if p.state != TradeState::Planned {
+        continue;
+      }
+      if let Some(trade) = &mut p.trade {
+        trade.describe =
+          [&trade.op.buy_pool, &trade.op.sell_pool].map(|pool| note.describe.get(pool).cloned());
+        trade.timing = note.timing;
+      }
+    }
+  }
+
   /// The detail every entry of `p` carries: its gas settings and, for a trade, the op.
   fn base_detail(&self, p: &Pending) -> TradeDetail {
     let mut detail = TradeDetail {
@@ -562,6 +626,8 @@ impl<P: Provider> Engine<P> {
       detail.amount = Some(op.amount);
       detail.quoted_profit = Some(op.profit);
       detail.floor = Some(op.floor);
+      [detail.buy_describe, detail.sell_describe] = trade.describe.clone();
+      detail.latency_us = trade.latency;
     }
     detail
   }
@@ -648,7 +714,9 @@ impl<P: Provider> Engine<P> {
         return self.drop_unsent(index);
       }
     };
+    let signed = Instant::now();
     let outcome = self.provider.send_raw_transaction(&raw).await;
+    let sent = Instant::now();
     if let Err(e) = &outcome
       && rejected(e)
     {
@@ -660,6 +728,9 @@ impl<P: Provider> Engine<P> {
     p.tx = Some(hash);
     p.state = TradeState::Sent;
     p.sent_block = self.block;
+    if let Some(trade) = &mut p.trade {
+      trade.latency = trade.timing.map(|timing| latency(&timing, signed, sent));
+    }
     match outcome {
       Ok(_) => self.lanes[lane].nonce = nonce.checked_add(1),
       Err(e) => {
@@ -1240,8 +1311,9 @@ impl<P: Provider> Engine<P> {
   /// held up by the sends.
   async fn handle(&mut self, command: EngineCmd) {
     match command {
-      EngineCmd::Submit { ops, reply } => {
+      EngineCmd::Submit { ops, note, reply } => {
         let verdicts = self.accept(ops, self.block);
+        self.annotate(&note);
         if reply.send(verdicts).is_err() {
           debug!("submitter gone before the reply");
         }
@@ -1476,6 +1548,8 @@ mod tests {
       base_fee: 10 * GWEI,
       gas_used: 15_000_000,
       gas_limit: 30_000_000,
+      timestamp: 0,
+      seen: Instant::now(),
       logs: Vec::new(),
       gap: false,
     }
@@ -1911,6 +1985,7 @@ mod tests {
     commands
       .send(EngineCmd::Submit {
         ops: vec![op(1, 2, 9)],
+        note: SubmitNote::default(),
         reply,
       })
       .await
@@ -1960,6 +2035,37 @@ mod tests {
         (1, EntryKind::Trade, TradeState::Sent),
         (1, EntryKind::Trade, TradeState::Executed),
       ]
+    );
+  }
+
+  /// A submit's note puts both pools' descriptions and the latency stages, in order and
+  /// measured from the head, on the trade's sent entry.
+  #[tokio::test]
+  async fn submit_note_fills_describe_and_latency() {
+    let mut f = fixture("note", 2, 16).await;
+    let seen = Instant::now() - Duration::from_millis(5);
+    let timing = Timing {
+      seen,
+      read: seen + Duration::from_micros(10),
+      decided: seen + Duration::from_micros(30),
+    };
+    let note = SubmitNote {
+      describe: HashMap::from([(pool(1), "buy pool".into()), (pool(2), "sell pool".into())]),
+      timing: Some(timing),
+    };
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    f.engine.annotate(&note);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    let entries = journal_entries(&f.journal, 2).await;
+    let sent = &entries[1].detail;
+    assert_eq!(sent.buy_describe.as_deref(), Some("buy pool"));
+    assert_eq!(sent.sell_describe.as_deref(), Some("sell pool"));
+    let stages = sent.latency_us.unwrap();
+    assert_eq!(stages[..2], [10, 30]);
+    assert!(
+      stages[1] <= stages[2] && stages[2] <= stages[3],
+      "{stages:?}"
     );
   }
 
