@@ -112,14 +112,18 @@ sol! {
   /// The slice of ERC20 the adapter uses.
   #[sol(rpc)]
   interface IERC20 {
+    event Transfer(address indexed from, address indexed to, uint256 value);
     function balanceOf(address account) external view returns (uint256 balance);
     function transfer(address to, uint256 value) external returns (bool ok);
     function decimals() external view returns (uint8 places);
   }
 
-  /// Wrapped native token deposit, used when funding on a fork.
+  /// Wrapped native token: deposit for fork funding, and its wrap and unwrap events, read
+  /// with `Transfer` to measure what a trade left in the executor.
   #[sol(rpc)]
   interface IWETH {
+    event Deposit(address indexed dst, uint256 wad);
+    event Withdrawal(address indexed src, uint256 wad);
     function deposit() external payable;
   }
 }

@@ -76,6 +76,16 @@ impl Holdings {
     }
   }
 
+  /// The treasury that sweeps and forwards pay, whose balance the engine reports.
+  pub fn treasury(&self) -> Address {
+    self.treasury
+  }
+
+  /// The wrapped native token the executor holds profit in.
+  pub fn weth(&self) -> Address {
+    self.weth
+  }
+
   /// Replaces the limits; the next block uses them.
   pub fn set_limits(&mut self, limits: Limits) {
     self.limits = limits;

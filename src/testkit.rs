@@ -23,7 +23,7 @@ pub use crate::chain::evm::venue::v4::{v4_fixture, v4_fixture_quoting};
 const BPS: u64 = 10_000;
 
 /// Provider that answers each request with the next response queued on `asserter`.
-pub fn mock_provider(asserter: &Asserter) -> impl Provider + Clone + 'static {
+pub fn mock_provider(asserter: &Asserter) -> impl Provider + Clone + use<> {
   ProviderBuilder::new().connect_mocked_client(asserter.clone())
 }
 

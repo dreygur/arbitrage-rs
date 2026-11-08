@@ -57,16 +57,20 @@ pub struct V4Key {
 }
 
 impl V4Key {
-  /// Pool id the PoolManager uses: `keccak256(abi.encode(key))`.
-  pub fn pool_id(&self) -> B256 {
-    let key = PoolKey {
+  /// The key as the Solidity `PoolKey` struct, as the PoolManager and the executor take it.
+  pub fn pool_key(&self) -> PoolKey {
+    PoolKey {
       currency0: self.currency0,
       currency1: self.currency1,
       fee: U24::saturating_from(self.fee),
       tickSpacing: self.tick_spacing.to_i24(),
       hooks: self.hooks,
-    };
-    keccak256(key.abi_encode())
+    }
+  }
+
+  /// Pool id the PoolManager uses: `keccak256(abi.encode(key))`.
+  pub fn pool_id(&self) -> B256 {
+    keccak256(self.pool_key().abi_encode())
   }
 }
 
