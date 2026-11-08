@@ -15,6 +15,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolEvent, SolValue};
+use alloy::transports::TransportError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
@@ -43,6 +44,9 @@ const COMMANDS: usize = 64;
 const TRANSFER_GAS: u64 = 21_000;
 /// Gas limit of an owner sweep call, a WETH transfer behind an owner check.
 const SWEEP_GAS: u64 = 100_000;
+/// Error replies (lowercase) by which geth, reth, erigon and anvil say they already hold a
+/// transaction.
+const KNOWN_REPLIES: [&str; 3] = ["already known", "known transaction", "already imported"];
 
 /// A request to the engine task.
 #[derive(Debug)]
@@ -101,10 +105,13 @@ struct TradeInfo {
 }
 
 /// A zero value self transfer replacing a stuck transaction at its nonce.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Cancel {
   /// Hash of the cancel.
   tx: B256,
+  /// The signed cancel, rebroadcast each block until it or the original is mined, since a
+  /// mempool may evict it.
+  raw: Bytes,
   /// Fee cap, 10% over the original's.
   fee_cap: u128,
   /// Tip, 10% over the original's.
@@ -147,6 +154,8 @@ struct Pending {
   trade: Option<TradeInfo>,
   /// Set once a cancel is sent.
   cancel: Option<Cancel>,
+  /// Set when the send failed in a way that may still have reached the mempool.
+  unconfirmed: bool,
 }
 
 impl Pending {
@@ -268,6 +277,20 @@ pub fn weth_gain(logs: &[Log], weth: Address, executor: Address) -> Option<Amoun
   gained.checked_sub(spent)
 }
 
+/// Whether a failed `eth_sendRawTransaction` is a definite rejection: an error reply from the
+/// node, other than one saying it already holds the transaction. A timeout, a lost
+/// connection, an unreadable reply or "already known" may mean the transaction reached the
+/// mempool, so it must be followed rather than dropped.
+fn rejected(error: &TransportError) -> bool {
+  match error {
+    TransportError::ErrorResp(payload) => {
+      let message = payload.message.to_lowercase();
+      !KNOWN_REPLIES.iter().any(|known| message.contains(known))
+    }
+    _ => false,
+  }
+}
+
 /// Signs `tx`, returning the raw envelope and its hash.
 fn sign(signer: &PrivateKeySigner, mut tx: TxEip1559) -> Result<(Bytes, B256)> {
   let signature = signer
@@ -324,6 +347,9 @@ pub struct Engine<P> {
 impl<P: Provider> Engine<P> {
   /// Builds an engine over `signers`, account `owner` being the owner; nothing is read from
   /// the node until it is spawned.
+  ///
+  /// Ledger ids start at `first_id`, which the caller seeds from the journal (the highest id
+  /// it holds plus one) so ids stay unique across restarts within the journal's lifetime.
   #[allow(
     clippy::too_many_arguments,
     reason = "the engine owns every piece the chain hands it at connect"
@@ -340,6 +366,7 @@ impl<P: Provider> Engine<P> {
     legs: HashMap<Id, LegSpec>,
     journal: JournalTx,
     events: mpsc::Sender<TradeEvent>,
+    first_id: u64,
   ) -> Self {
     let lanes = signers
       .into_iter()
@@ -367,7 +394,7 @@ impl<P: Provider> Engine<P> {
       next_base_fee: None,
       paused: false,
       pending: Vec::new(),
-      next_id: 1,
+      next_id: first_id,
       executor_balance: Amount::ZERO,
       treasury_balance: Amount::ZERO,
     }
@@ -385,7 +412,8 @@ impl<P: Provider> Engine<P> {
     fee_cap(self.next_base_fee.unwrap_or(0), &self.evm)
   }
 
-  /// Whether `gas_limit` at `fee` stays within `max_gas_cost`.
+  /// Whether `gas_limit` at `fee` stays within `max_gas_cost`. Callers pass the fee cap a
+  /// transaction is signed with, the most it can cost.
   fn within_cost(&self, gas_limit: u64, fee: u128) -> bool {
     gas_cost(gas_limit, fee) <= self.live.max_gas_cost
   }
@@ -412,12 +440,22 @@ impl<P: Provider> Engine<P> {
       .map(|p| p.id)
   }
 
-  /// The synced operator lane at or above `account_min_gas` with the fewest trades in
-  /// flight, the lowest index on a tie; never the owner.
+  /// Whether `lane` has a cancel out that is not mined, so its later nonces wait behind a
+  /// stuck one and a new trade there would only time out too.
+  fn lane_stuck(&self, lane: usize) -> bool {
+    self
+      .pending
+      .iter()
+      .any(|p| p.lane == lane && p.cancel.is_some() && !p.finished())
+  }
+
+  /// The synced, unstuck operator lane at or above `account_min_gas` with the fewest trades
+  /// in flight, the lowest index on a tie; never the owner.
   fn operator_lane(&self) -> Option<usize> {
     let min = self.live.limits.account_min_gas;
     (0..self.lanes.len())
       .filter(|&i| i != self.owner && self.lanes[i].nonce.is_some() && self.lanes[i].eth >= min)
+      .filter(|&i| !self.lane_stuck(i))
       .min_by_key(|&i| (self.lane_in_flight(i), i))
   }
 
@@ -426,9 +464,9 @@ impl<P: Provider> Engine<P> {
     if self.paused {
       return Verdict::Paused;
     }
-    let Some(fee) = fee else {
+    if fee.is_none() {
       return Verdict::GasCap;
-    };
+    }
     let (buy, sell) = match build_legs(op, &self.legs) {
       Ok(legs) => legs,
       Err(e) => {
@@ -442,7 +480,8 @@ impl<P: Provider> Engine<P> {
     };
     let pair = pair_index(buy_spec.family, sell_spec.family);
     let gas_limit = self.gas.limit(pair);
-    if !self.within_cost(gas_limit, fee) {
+    let fee_cap = self.cap();
+    if !self.within_cost(gas_limit, fee_cap) {
       return Verdict::GasCap;
     }
     let holder = [&op.buy_pool, &op.sell_pool]
@@ -472,7 +511,7 @@ impl<P: Provider> Engine<P> {
       value: Amount::ZERO,
       data: call.abi_encode().into(),
       gas_limit,
-      fee_cap: self.cap(),
+      fee_cap,
       tip: self.evm.priority_fee,
       nonce: 0,
       tx: None,
@@ -483,13 +522,15 @@ impl<P: Provider> Engine<P> {
         pair,
       }),
       cancel: None,
+      unconfirmed: false,
     });
     self.next_id += 1;
     Verdict::Sent
   }
 
   /// Accepts or refuses `ops` best first: `Paused` while paused, `GasCap` when the fee cap
-  /// blocks sending or the gas cost passes `max_gas_cost`, `Locked(id)` when a pool is held
+  /// blocks sending or the gas limit at the fee cap passes `max_gas_cost`, `Locked(id)` when a
+  /// pool is held
   /// by trade `id` (an earlier op of this batch included), `CircuitOpen` when a breaker
   /// refuses a pool, `LowGas` when no operator lane can send. Accepted ops become `Planned`
   /// and lock both pools. Every op comes back unchanged.
@@ -548,80 +589,104 @@ impl<P: Provider> Engine<P> {
     }
   }
 
-  /// Reads `lane`'s pending nonce from the node; on failure the lane waits for a later sync.
-  async fn resync(&mut self, lane: usize) {
+  /// Reads `lane`'s nonce at `block` from the node, `None` when the read fails.
+  async fn nonce_at(&self, lane: usize, block: BlockId) -> Option<u64> {
     let address = self.lanes[lane].signer.address();
-    match self.provider.get_transaction_count(address).pending().await {
-      Ok(nonce) => self.lanes[lane].nonce = Some(nonce),
+    match self
+      .provider
+      .get_transaction_count(address)
+      .block_id(block)
+      .await
+    {
+      Ok(nonce) => Some(nonce),
       Err(e) => {
         warn!(lane, error = %e, "nonce read failed");
-        self.lanes[lane].nonce = None;
+        None
       }
     }
   }
 
-  /// Signs and sends the planned entry at `index` with its lane's next nonce. Signing just
-  /// before sending means a lane resync after an error gives every later entry a fresh nonce.
-  async fn send_one(&mut self, index: usize) {
+  /// Reads `lane`'s pending nonce from the node; on failure the lane waits for a later sync.
+  async fn resync(&mut self, lane: usize) {
+    self.lanes[lane].nonce = self.nonce_at(lane, BlockId::pending()).await;
+  }
+
+  /// Marks the entry at `index` dropped before it reached the node, returning its planned
+  /// and dropped entries.
+  fn drop_unsent(&mut self, index: usize) -> Vec<TradeEvent> {
+    self.pending[index].state = TradeState::Dropped;
+    let p = &self.pending[index];
+    vec![
+      self.event(p, p.kind, TradeState::Planned, None),
+      self.event(p, p.kind, TradeState::Dropped, None),
+    ]
+  }
+
+  /// Signs and sends the planned entry at `index` with its lane's next nonce, returning the
+  /// entries to journal. A lane without a known nonce is resynced first, so after a send
+  /// error only that lane's next send waits on a nonce read and the entry signs fresh.
+  ///
+  /// A definite rejection drops the entry. Any other failure keeps it `Sent` under the hash
+  /// computed locally, locks held, flagged unconfirmed until a block shows whether the node
+  /// has it. Either way the lane's nonce is read again before its next send.
+  async fn send_one(&mut self, index: usize) -> Vec<TradeEvent> {
     let lane = self.pending[index].lane;
+    let id = self.pending[index].id;
+    if self.lanes[lane].nonce.is_none() {
+      self.resync(lane).await;
+    }
     let Some(nonce) = self.lanes[lane].nonce else {
-      warn!(
-        lane,
-        id = self.pending[index].id,
-        "lane nonce unknown, transaction dropped"
-      );
-      self.pending[index].state = TradeState::Dropped;
-      let p = &self.pending[index];
-      let (planned, dropped) = (
-        self.event(p, p.kind, TradeState::Planned, None),
-        self.event(p, p.kind, TradeState::Dropped, None),
-      );
-      self.emit(planned).await;
-      self.emit(dropped).await;
-      return;
+      warn!(lane, id, "lane nonce unknown, transaction dropped");
+      return self.drop_unsent(index);
     };
     self.pending[index].nonce = nonce;
     let unsigned = self.pending[index].unsigned(self.evm.chain_id, nonce);
-    let sent = match sign(&self.lanes[lane].signer, unsigned) {
-      Ok((raw, hash)) => self
-        .provider
-        .send_raw_transaction(&raw)
-        .await
-        .map(|_| hash)
-        .map_err(Error::from),
-      Err(e) => Err(e),
-    };
-    let p = &self.pending[index];
-    let planned = self.event(p, p.kind, TradeState::Planned, None);
-    self.emit(planned).await;
-    match sent {
-      Ok(hash) => {
-        let p = &mut self.pending[index];
-        p.tx = Some(hash);
-        p.state = TradeState::Sent;
-        p.sent_block = self.block;
-        self.lanes[lane].nonce = Some(nonce + 1);
-        let p = &self.pending[index];
-        let event = self.event(p, p.kind, TradeState::Sent, Some(hash));
-        self.emit(event).await;
-      }
+    let (raw, hash) = match sign(&self.lanes[lane].signer, unsigned) {
+      Ok(signed) => signed,
       Err(e) => {
-        warn!(lane, nonce, id = self.pending[index].id, error = %e, "send failed, resyncing the lane nonce");
-        self.pending[index].state = TradeState::Dropped;
-        let p = &self.pending[index];
-        let event = self.event(p, p.kind, TradeState::Dropped, None);
-        self.emit(event).await;
-        self.resync(lane).await;
+        warn!(lane, id, error = %e, "signing failed, transaction dropped");
+        return self.drop_unsent(index);
+      }
+    };
+    let outcome = self.provider.send_raw_transaction(&raw).await;
+    if let Err(e) = &outcome
+      && rejected(e)
+    {
+      warn!(lane, nonce, id, error = %e, "send rejected, transaction dropped");
+      self.lanes[lane].nonce = None;
+      return self.drop_unsent(index);
+    }
+    let p = &mut self.pending[index];
+    p.tx = Some(hash);
+    p.state = TradeState::Sent;
+    p.sent_block = self.block;
+    match outcome {
+      Ok(_) => self.lanes[lane].nonce = nonce.checked_add(1),
+      Err(e) => {
+        warn!(lane, nonce, id, %hash, error = %e, "send outcome unknown, following the hash");
+        p.unconfirmed = true;
+        self.lanes[lane].nonce = None;
       }
     }
+    let p = &self.pending[index];
+    vec![
+      self.event(p, p.kind, TradeState::Planned, None),
+      self.event(p, p.kind, TradeState::Sent, Some(hash)),
+    ]
   }
 
-  /// Sends every planned entry in id order, so each lane's nonces are consecutive.
+  /// Sends every planned entry in id order, so each lane's nonces are consecutive, then
+  /// journals them. Journaling after the whole batch keeps the sends back to back, at the
+  /// price that a crash between a send and the journal write loses those lines.
   async fn send_planned(&mut self) {
+    let mut events = Vec::new();
     for index in 0..self.pending.len() {
       if self.pending[index].state == TradeState::Planned {
-        self.send_one(index).await;
+        events.extend(self.send_one(index).await);
       }
+    }
+    for event in events {
+      self.emit(event).await;
     }
   }
 
@@ -682,6 +747,7 @@ impl<P: Provider> Engine<P> {
     }
     let lost = p
       .cancel
+      .as_ref()
       .map(|cancel| self.event(p, EntryKind::Cancel, TradeState::Dropped, Some(cancel.tx)));
     self.emit(event).await;
     if let Some(lost) = lost {
@@ -696,7 +762,7 @@ impl<P: Provider> Engine<P> {
     p.state = TradeState::Dropped;
     p.mined_block = Some(mined);
     let p = &self.pending[index];
-    let Some(cancel) = p.cancel else {
+    let Some(cancel) = &p.cancel else {
       return;
     };
     let mut won = self.event(p, EntryKind::Cancel, TradeState::Executed, Some(cancel.tx));
@@ -714,29 +780,119 @@ impl<P: Provider> Engine<P> {
     self.emit(dropped).await;
   }
 
+  /// Settles the entry at `index` as dropped because another transaction took its nonce:
+  /// neither it nor its cancel has a receipt, yet the nonce is used. Its locks are freed
+  /// once, its cancel is journaled as dropped too, and its lane is resynced before its next
+  /// send.
+  fn replaced(&mut self, index: usize) -> Vec<TradeEvent> {
+    let block = self.block;
+    let p = &mut self.pending[index];
+    warn!(
+      id = p.id,
+      lane = p.lane,
+      nonce = p.nonce,
+      "nonce taken by another transaction, dropped"
+    );
+    p.state = TradeState::Dropped;
+    p.mined_block = Some(block);
+    self.lanes[p.lane].nonce = None;
+    let p = &self.pending[index];
+    let mut events = vec![self.event(p, p.kind, TradeState::Dropped, p.tx)];
+    if let Some(cancel) = &p.cancel {
+      events.push(self.event(p, EntryKind::Cancel, TradeState::Dropped, Some(cancel.tx)));
+    }
+    events
+  }
+
+  /// Settles whether the unconfirmed entry at `index` reached the node: known by hash, it
+  /// is followed like any sent entry; unknown while the lane's pending nonce has not passed
+  /// its nonce, it never got there and is dropped; otherwise the next block asks again.
+  async fn confirm(&mut self, index: usize) -> Vec<TradeEvent> {
+    let p = &self.pending[index];
+    let (Some(tx), lane, nonce) = (p.tx, p.lane, p.nonce) else {
+      return Vec::new();
+    };
+    match self.provider.get_transaction_by_hash(tx).await {
+      Ok(Some(_)) => {
+        self.pending[index].unconfirmed = false;
+        return Vec::new();
+      }
+      Ok(None) => {}
+      Err(e) => {
+        warn!(%tx, error = %e, "transaction read failed");
+        return Vec::new();
+      }
+    }
+    let pending = self.nonce_at(lane, BlockId::pending()).await;
+    if !pending.is_some_and(|pending| pending <= nonce) {
+      return Vec::new();
+    }
+    warn!(
+      id = self.pending[index].id,
+      lane, nonce, "node never took the transaction, dropped"
+    );
+    self.pending[index].state = TradeState::Dropped;
+    self.lanes[lane].nonce = None;
+    let p = &self.pending[index];
+    vec![self.event(p, p.kind, TradeState::Dropped, p.tx)]
+  }
+
   /// Reads the receipt of every sent entry, and of its cancel while the original has none.
+  ///
+  /// An entry with neither receipt that is unconfirmed or past `trade_timeout` has its
+  /// lane's nonce read at this block (once per lane): a nonce past the entry's means another
+  /// transaction took it, which no receipt we follow will ever show. An unconfirmed entry
+  /// still holding its nonce is then checked by hash.
   async fn check_receipts(&mut self) {
+    let mut used_nonces: HashMap<usize, Option<u64>> = HashMap::new();
+    let mut events = Vec::new();
     for index in 0..self.pending.len() {
       let p = &self.pending[index];
       if p.state != TradeState::Sent {
         continue;
       }
-      let (Some(tx), cancel) = (p.tx, p.cancel.map(|cancel| cancel.tx)) else {
+      let (Some(tx), cancel) = (p.tx, p.cancel.as_ref().map(|cancel| cancel.tx)) else {
         continue;
       };
       if let Some(receipt) = self.receipt(tx).await {
         self.finish(index, receipt).await;
-      } else if let Some(cancel) = cancel
+        continue;
+      }
+      if let Some(cancel) = cancel
         && let Some(receipt) = self.receipt(cancel).await
       {
         self.cancelled(index, receipt).await;
+        continue;
       }
+      let p = &self.pending[index];
+      let timed_out = self.block.saturating_sub(p.sent_block) > self.live.trade_timeout;
+      if !p.unconfirmed && !timed_out {
+        continue;
+      }
+      let (lane, nonce) = (p.lane, p.nonce);
+      let used = match used_nonces.get(&lane) {
+        Some(used) => *used,
+        None => {
+          let used = self.nonce_at(lane, BlockId::number(self.block)).await;
+          used_nonces.insert(lane, used);
+          used
+        }
+      };
+      if used.is_some_and(|used| used > nonce) {
+        events.extend(self.replaced(index));
+      } else if self.pending[index].unconfirmed {
+        events.extend(self.confirm(index).await);
+      }
+    }
+    for event in events {
+      self.emit(event).await;
     }
   }
 
   /// Replaces the stuck entry at `index` with a zero value self transfer at its nonce, fee
   /// cap and tip bumped 10%, which stays under `max_fee_per_gas` by the fee cap's design.
-  /// A failed send is retried next block.
+  /// A rejected send is retried next block; a send whose outcome is unknown counts as sent,
+  /// since the rebroadcast each block delivers it either way.
   async fn send_cancel(&mut self, index: usize) {
     let p = &self.pending[index];
     let (fee_cap, tip) = (bump(p.fee_cap), bump(p.tip));
@@ -756,24 +912,23 @@ impl<P: Provider> Engine<P> {
       access_list: Default::default(),
       input: Bytes::new(),
     };
-    let sent = match sign(signer, unsigned) {
-      Ok((raw, hash)) => self
-        .provider
-        .send_raw_transaction(&raw)
-        .await
-        .map(|_| hash)
-        .map_err(Error::from),
-      Err(e) => Err(e),
-    };
-    let hash = match sent {
-      Ok(hash) => hash,
+    let (raw, hash) = match sign(signer, unsigned) {
+      Ok(signed) => signed,
       Err(e) => {
-        warn!(id = self.pending[index].id, error = %e, "cancel send failed, retrying next block");
+        warn!(id = p.id, error = %e, "cancel signing failed, retrying next block");
         return;
       }
     };
+    if let Err(e) = self.provider.send_raw_transaction(&raw).await {
+      if rejected(&e) {
+        warn!(id = self.pending[index].id, error = %e, "cancel rejected, retrying next block");
+        return;
+      }
+      warn!(id = self.pending[index].id, error = %e, "cancel send outcome unknown, rebroadcasting");
+    }
     let cancel = Cancel {
       tx: hash,
+      raw,
       fee_cap,
       tip,
     };
@@ -793,8 +948,10 @@ impl<P: Provider> Engine<P> {
     self.emit(sent).await;
   }
 
-  /// Cancels every entry sent more than `trade_timeout` blocks ago, unless the fee cap
-  /// blocks sending, in which case the next block tries again.
+  /// Cancels every entry sent more than `trade_timeout` blocks ago and rebroadcasts every
+  /// cancel already out, unless the fee cap blocks sending, in which case the next block
+  /// tries again. A rebroadcast needs no new bump: the cancel already sits at the most the
+  /// fee cap allows, and "already known" replies are expected.
   async fn send_cancels(&mut self) {
     if self.fee().is_none() {
       return;
@@ -802,8 +959,16 @@ impl<P: Provider> Engine<P> {
     for index in 0..self.pending.len() {
       let p = &self.pending[index];
       let stuck = self.block.saturating_sub(p.sent_block) > self.live.trade_timeout;
-      if p.state == TradeState::Sent && p.cancel.is_none() && stuck {
-        self.send_cancel(index).await;
+      if p.state != TradeState::Sent || !stuck {
+        continue;
+      }
+      match &p.cancel {
+        None => self.send_cancel(index).await,
+        Some(cancel) => {
+          if let Err(e) = self.provider.send_raw_transaction(&cancel.raw).await {
+            debug!(id = p.id, error = %e, "cancel rebroadcast not taken");
+          }
+        }
       }
     }
   }
@@ -867,12 +1032,17 @@ impl<P: Provider> Engine<P> {
     })
   }
 
-  /// Plans a sweep or forward at `fee` per gas, unless one of its kind is still in progress
-  /// on that lane or its gas cost passes `max_gas_cost`.
-  fn queue(&mut self, request: TxRequest, fee: u128) {
+  /// Plans a sweep or forward, returning whether it was planned: not while the fee cap
+  /// blocks sending, while one of its kind is still in progress on that lane, or when its
+  /// gas limit at the fee cap it would be signed with passes `max_gas_cost`.
+  fn queue(&mut self, request: TxRequest) -> bool {
+    if self.fee().is_none() {
+      warn!(kind = ?request.kind, "fee over the cap, transfer not sent");
+      return false;
+    }
     if request.from >= self.lanes.len() {
       warn!(from = request.from, "request from an unknown account");
-      return;
+      return false;
     }
     let busy = self
       .pending
@@ -880,16 +1050,17 @@ impl<P: Provider> Engine<P> {
       .any(|p| p.lane == request.from && p.kind == request.kind && !p.finished());
     if busy {
       debug!(from = request.from, kind = ?request.kind, "previous transfer still in progress");
-      return;
+      return false;
     }
     let gas_limit = if request.data.is_empty() {
       TRANSFER_GAS
     } else {
       SWEEP_GAS
     };
-    if !self.within_cost(gas_limit, fee) {
+    let fee_cap = self.cap();
+    if !self.within_cost(gas_limit, fee_cap) {
       warn!(kind = ?request.kind, "transfer gas cost above max_gas_cost, not sent");
-      return;
+      return false;
     }
     self.pending.push(Pending {
       id: self.next_id,
@@ -900,7 +1071,7 @@ impl<P: Provider> Engine<P> {
       value: request.value,
       data: request.data,
       gas_limit,
-      fee_cap: self.cap(),
+      fee_cap,
       tip: self.evm.priority_fee,
       nonce: 0,
       tx: None,
@@ -908,8 +1079,10 @@ impl<P: Provider> Engine<P> {
       mined_block: None,
       trade: None,
       cancel: None,
+      unconfirmed: false,
     });
     self.next_id += 1;
+    true
   }
 
   /// Reads the nonce of every lane that has none.
@@ -939,22 +1112,20 @@ impl<P: Provider> Engine<P> {
     let Some(balances) = self.read_balances(BlockId::number(block.number)).await else {
       return;
     };
-    let requests = self.holdings.on_block(&balances, fee.is_some());
-    if let Some(fee) = fee {
-      for request in requests {
-        self.queue(request, fee);
-      }
+    for request in self.holdings.on_block(&balances, fee.is_some()) {
+      self.queue(request);
     }
     self.send_planned().await;
     self.release();
   }
 
-  /// Sweeps the executor's whole WETH balance, read now, from the owner lane.
+  /// Sweeps the executor's whole WETH balance, read now, from the owner lane. The operator
+  /// asked for it, so a sweep that cannot go out says why at `warn`.
   async fn sweep_all(&mut self) {
-    let Some(fee) = self.fee() else {
+    if self.fee().is_none() {
       warn!("fee over the cap, sweep not sent");
       return;
-    };
+    }
     let Some(balances) = self.read_balances(BlockId::latest()).await else {
       return;
     };
@@ -972,7 +1143,10 @@ impl<P: Provider> Engine<P> {
       data: call.abi_encode().into(),
       kind: EntryKind::Sweep,
     };
-    self.queue(request, fee);
+    if !self.queue(request) {
+      warn!("sweep not sent: a sweep is still in progress or it costs too much gas");
+      return;
+    }
     self.send_planned().await;
     self.release();
   }
@@ -1028,6 +1202,7 @@ impl<P: Provider> Engine<P> {
         next_base_fee: self.next_base_fee.unwrap_or(0),
         fee_cap: self.cap(),
         max_fee_per_gas: self.evm.max_fee_per_gas,
+        // The engine never sees the feed; `EvmChain::status` fills the lag in.
         feed_lag_ms: 0,
         executor: self.executor.to_string(),
         executor_balance: self.executor_balance,
@@ -1086,6 +1261,7 @@ mod tests {
   use alloy::providers::mock::Asserter;
   use alloy::signers::local::MnemonicBuilder;
   use alloy::signers::local::coins_bip39::English;
+  use alloy::transports::TransportErrorKind;
 
   use super::*;
   use crate::chain::evm::bindings::PoolKey;
@@ -1205,9 +1381,14 @@ mod tests {
   }
 
   /// An engine over the first `accounts` anvil accounts, owner 0, every lane synced at nonce
-  /// zero with 1 ETH, at block 10 with a next base fee of 10 gwei; `events` is the dashboard
-  /// channel capacity.
-  async fn fixture(name: &str, accounts: u32, events: usize) -> Fixture<impl Provider + use<>> {
+  /// zero with 1 ETH, at block 10 with a next base fee of 10 gwei, its ledger ids starting at
+  /// `first_id`; `events` is the dashboard channel capacity.
+  async fn fixture_from(
+    name: &str,
+    accounts: u32,
+    events: usize,
+    first_id: u64,
+  ) -> Fixture<impl Provider + use<>> {
     let asserter = Asserter::new();
     let signers = (0..accounts)
       .map(|i| {
@@ -1237,6 +1418,7 @@ mod tests {
       legs(),
       journal,
       events_tx,
+      first_id,
     );
     for lane in &mut engine.lanes {
       lane.nonce = Some(0);
@@ -1251,6 +1433,16 @@ mod tests {
       events: events_rx,
       journal: path,
     }
+  }
+
+  /// [`fixture_from`] with ledger ids starting at 1.
+  async fn fixture(name: &str, accounts: u32, events: usize) -> Fixture<impl Provider + use<>> {
+    fixture_from(name, accounts, events, 1).await
+  }
+
+  /// Queues a nonce read answer.
+  fn push_nonce(asserter: &Asserter, nonce: u64) {
+    asserter.push_success(&U64::from(nonce));
   }
 
   /// A head at `number` exactly at its gas target, so the base fee holds at 10 gwei.
@@ -1428,11 +1620,12 @@ mod tests {
     f.engine.on_block(head(13), 13).await;
     assert!(f.engine.pending[0].cancel.is_none());
     push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
     push_sent(&f.asserter);
     push_balances(&f.asserter, 2, ETH);
     f.engine.on_block(head(14), 14).await;
     let trade = &f.engine.pending[0];
-    let cancel = trade.cancel.expect("cancel sent");
+    let cancel = trade.cancel.clone().expect("cancel sent");
     assert_eq!(trade.state, TradeState::Sent);
     assert_eq!(trade.nonce, 0);
     assert_eq!(cancel.fee_cap, bump(trade.fee_cap));
@@ -1441,8 +1634,14 @@ mod tests {
     assert_eq!(f.engine.lanes[1].nonce, Some(1));
     push_unmined(&f.asserter);
     push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    f.asserter.push_failure_msg("already known");
     push_balances(&f.asserter, 2, ETH);
     f.engine.on_block(head(15), 15).await;
+    assert_eq!(
+      f.engine.pending[0].cancel.as_ref().map(|c| c.tx),
+      Some(cancel.tx)
+    );
     assert!(f.asserter.read_q().is_empty());
     let events = drain(&mut f.events);
     assert!(events.contains(&(1, EntryKind::Cancel, TradeState::Sent)));
@@ -1463,16 +1662,22 @@ mod tests {
     push_sent(&f.asserter);
     push_sent(&f.asserter);
     f.engine.send_planned().await;
-    push_unmined(&f.asserter);
-    push_unmined(&f.asserter);
+    for _ in 0..2 {
+      push_unmined(&f.asserter);
+      push_nonce(&f.asserter, 0);
+    }
     push_sent(&f.asserter);
     push_sent(&f.asserter);
     push_balances(&f.asserter, 3, ETH);
     f.engine.on_block(head(14), 14).await;
     assert!(f.engine.pending.iter().all(|p| p.cancel.is_some()));
-    for _ in 0..4 {
+    for _ in 0..2 {
       push_unmined(&f.asserter);
+      push_unmined(&f.asserter);
+      push_nonce(&f.asserter, 0);
     }
+    push_sent(&f.asserter);
+    push_sent(&f.asserter);
     push_balances(&f.asserter, 3, ETH);
     f.engine.on_block(head(15), 15).await;
     let verdicts = f.engine.accept(vec![op(1, 5, 9), op(3, 6, 8)], 15);
@@ -1552,16 +1757,17 @@ mod tests {
     assert_eq!(lanes, vec![0, 0]);
   }
 
-  /// A base fee over the cap, or a gas cost over `max_gas_cost`, refuses with `GasCap`.
+  /// A base fee over the cap, or a gas cost over `max_gas_cost` at the fee cap the trade
+  /// would be signed with, refuses with `GasCap`.
   #[tokio::test]
   async fn fee_cap_refuses_trades() {
     let mut f = fixture("fee-cap", 2, 16).await;
     f.engine.next_base_fee = Some(45 * GWEI);
     assert_eq!(f.engine.accept(vec![op(1, 2, 9)], 10)[0].1, Verdict::GasCap);
     f.engine.next_base_fee = Some(10 * GWEI);
-    f.engine.live.max_gas_cost = gas_cost(250_000, 11 * GWEI) - wei(1);
+    f.engine.live.max_gas_cost = gas_cost(250_000, 21 * GWEI) - wei(1);
     assert_eq!(f.engine.accept(vec![op(1, 2, 9)], 10)[0].1, Verdict::GasCap);
-    f.engine.live.max_gas_cost = gas_cost(250_000, 11 * GWEI);
+    f.engine.live.max_gas_cost = gas_cost(250_000, 21 * GWEI);
     assert_eq!(f.engine.accept(vec![op(1, 2, 9)], 10)[0].1, Verdict::Sent);
     assert_eq!(f.engine.pending[0].fee_cap, 21 * GWEI);
     assert_eq!(f.engine.pending[0].tip, GWEI);
@@ -1794,5 +2000,278 @@ mod tests {
     );
     f.engine.control(Control::Resume).await;
     assert_eq!(f.engine.accept(vec![op(1, 2, 9)], 10)[0].1, Verdict::Sent);
+  }
+
+  /// Ledger ids start at the `first_id` the caller seeds from the journal.
+  #[tokio::test]
+  async fn ids_start_at_first_id() {
+    let mut f = fixture_from("first-id", 2, 16, 41).await;
+    let verdicts = f.engine.accept(vec![op(1, 2, 9), op(2, 3, 5)], 10);
+    assert_eq!(verdicts[1].1, Verdict::Locked(41));
+    assert_eq!(f.engine.pending[0].id, 41);
+    assert_eq!(f.engine.next_id, 42);
+  }
+
+  /// A stuck trade whose nonce another transaction consumed is dropped, its locks are
+  /// released, no cancel is sent, and its lane is resynced.
+  #[tokio::test]
+  async fn replaced_nonce_releases_locks() {
+    let mut f = fixture("replaced", 3, 16).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 1);
+    push_balances(&f.asserter, 3, ETH);
+    f.engine.on_block(head(14), 14).await;
+    assert!(f.engine.pending.is_empty());
+    assert_eq!(f.engine.lanes[1].nonce, None);
+    assert!(drain(&mut f.events).contains(&(1, EntryKind::Trade, TradeState::Dropped)));
+    let verdicts = f.engine.accept(vec![op(1, 3, 9)], 14);
+    assert_eq!(verdicts[0].1, Verdict::Sent);
+    assert_eq!(f.engine.pending[0].lane, 2);
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// A cancel that is not mined is rebroadcast each block, its lane gets no new trades, and
+  /// once the nonce is consumed with neither receipt both are dropped and the locks freed.
+  #[tokio::test]
+  async fn stuck_cancel_rebroadcast_until_replaced() {
+    let mut f = fixture("stuck-cancel", 2, 32).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_sent(&f.asserter);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(14), 14).await;
+    assert!(f.engine.pending[0].cancel.is_some());
+    assert_eq!(f.engine.accept(vec![op(3, 4, 9)], 14)[0].1, Verdict::LowGas);
+    push_unmined(&f.asserter);
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_sent(&f.asserter);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(15), 15).await;
+    assert_eq!(f.engine.pending[0].state, TradeState::Sent);
+    push_unmined(&f.asserter);
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 1);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(16), 16).await;
+    assert!(f.engine.pending.is_empty());
+    let events = drain(&mut f.events);
+    assert!(events.contains(&(1, EntryKind::Trade, TradeState::Dropped)));
+    assert!(events.contains(&(1, EntryKind::Cancel, TradeState::Dropped)));
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// An ambiguous send error keeps the trade sent with its local hash and its pools locked,
+  /// and the receipt then settles it.
+  #[tokio::test]
+  async fn ambiguous_send_keeps_trade_sent() {
+    let mut f = fixture("ambiguous", 3, 16).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    f.asserter.push_failure_msg("already known");
+    f.engine.send_planned().await;
+    f.engine.release();
+    let trade = &f.engine.pending[0];
+    assert_eq!(trade.state, TradeState::Sent);
+    assert!(trade.tx.is_some() && trade.unconfirmed);
+    assert_eq!(f.engine.lanes[1].nonce, None);
+    assert_eq!(
+      f.engine.accept(vec![op(1, 3, 9)], 10)[0].1,
+      Verdict::Locked(1)
+    );
+    push_nonce(&f.asserter, 1);
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 1);
+    push_balances(&f.asserter, 3, ETH);
+    f.engine.on_block(head(11), 11).await;
+    assert_eq!(f.engine.pending[0].state, TradeState::Sent);
+    assert_eq!(
+      f.engine.accept(vec![op(1, 3, 9)], 11)[0].1,
+      Verdict::Locked(1)
+    );
+    push_mined(&f.asserter, 12, true, 200_000);
+    push_balances(&f.asserter, 3, ETH);
+    f.engine.on_block(head(12), 12).await;
+    assert!(f.engine.pending.is_empty());
+    assert_eq!(
+      drain(&mut f.events),
+      vec![
+        (1, EntryKind::Trade, TradeState::Planned),
+        (1, EntryKind::Trade, TradeState::Sent),
+        (1, EntryKind::Trade, TradeState::Executed),
+      ]
+    );
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// An ambiguous send the node does not know, with the lane's pending nonce not past it,
+  /// is dropped and its locks released.
+  #[tokio::test]
+  async fn unknown_ambiguous_send_dropped() {
+    let mut f = fixture("ambiguous-lost", 3, 16).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    f.asserter.push_failure_msg("already known");
+    f.engine.send_planned().await;
+    push_nonce(&f.asserter, 0);
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_balances(&f.asserter, 3, ETH);
+    f.engine.on_block(head(11), 11).await;
+    assert!(f.engine.pending.is_empty());
+    assert_eq!(f.engine.lanes[1].nonce, None);
+    assert!(drain(&mut f.events).contains(&(1, EntryKind::Trade, TradeState::Dropped)));
+    assert_eq!(f.engine.accept(vec![op(1, 3, 9)], 11)[0].1, Verdict::Sent);
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// Only a node's error reply that is not "already known" is a definite rejection; timeouts
+  /// and other transport failures may have reached the mempool.
+  #[tokio::test]
+  async fn send_rejection_classified() {
+    let asserter = Asserter::new();
+    let provider = mock_provider(&asserter);
+    let reply = async |message: &'static str| {
+      asserter.push_failure_msg(message);
+      provider.send_raw_transaction(&[0x02]).await.unwrap_err()
+    };
+    assert!(rejected(
+      &reply("insufficient funds for gas * price + value").await
+    ));
+    assert!(rejected(&reply("nonce too low").await));
+    assert!(!rejected(&reply("already known").await));
+    assert!(!rejected(&reply("ALREADY KNOWN").await));
+    assert!(!rejected(&TransportErrorKind::custom_str(
+      "request timed out"
+    )));
+    assert!(!rejected(&TransportError::NullResp));
+  }
+
+  /// A send error on one lane sends the other lanes' trades with no RPC in between, and that
+  /// lane resyncs only before its own next send.
+  #[tokio::test]
+  async fn send_error_does_not_delay_other_lanes() {
+    let mut f = fixture("other-lanes", 3, 16).await;
+    f.engine
+      .accept(vec![op(1, 2, 9), op(3, 4, 8), op(5, 6, 7)], 10);
+    let lanes: Vec<usize> = f.engine.pending.iter().map(|p| p.lane).collect();
+    assert_eq!(lanes, vec![1, 2, 1]);
+    f.asserter
+      .push_failure_msg("insufficient funds for gas * price + value");
+    push_sent(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    let states: Vec<(TradeState, u64)> = f
+      .engine
+      .pending
+      .iter()
+      .map(|p| (p.state, p.nonce))
+      .collect();
+    assert_eq!(
+      states,
+      vec![
+        (TradeState::Dropped, 0),
+        (TradeState::Sent, 0),
+        (TradeState::Sent, 0)
+      ]
+    );
+    assert_eq!(f.engine.lanes[1].nonce, Some(1));
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// An out of gas receipt raises the cached limit, and the next trade is planned with it.
+  #[tokio::test]
+  async fn out_of_gas_receipt_raises_next_limit() {
+    let mut f = fixture("oog", 2, 16).await;
+    f.engine.breakers = Breakers::new(BreakerConfig {
+      max_revert_gas: wei(ETH),
+      ..breaker_config()
+    });
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    push_mined(&f.asserter, 11, false, 250_000);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(11), 11).await;
+    assert_eq!(f.engine.snapshot().gas_limits[0], 375_000);
+    assert_eq!(f.engine.accept(vec![op(3, 4, 9)], 11)[0].1, Verdict::Sent);
+    assert_eq!(f.engine.pending[0].gas_limit, 375_000);
+    let entries = journal_entries(&f.journal, 3).await;
+    assert_eq!(entries[2].detail.revert.as_deref(), Some("out of gas"));
+  }
+
+  /// No cancel goes out while the fee cap blocks sending; the next block sends it.
+  #[tokio::test]
+  async fn no_cancel_while_fee_over_cap() {
+    let mut f = fixture("cancel-fee", 2, 16).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    let mut expensive = head(14);
+    expensive.base_fee = 50 * GWEI;
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(expensive, 14).await;
+    assert!(f.engine.pending[0].cancel.is_none());
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_sent(&f.asserter);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(15), 15).await;
+    assert!(f.engine.pending[0].cancel.is_some());
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// A cancel whose send fails is tried again the next block.
+  #[tokio::test]
+  async fn failed_cancel_retried_next_block() {
+    let mut f = fixture("cancel-retry", 2, 16).await;
+    f.engine.accept(vec![op(1, 2, 9)], 10);
+    push_sent(&f.asserter);
+    f.engine.send_planned().await;
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    f.asserter
+      .push_failure_msg("replacement transaction underpriced");
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(14), 14).await;
+    assert!(f.engine.pending[0].cancel.is_none());
+    push_unmined(&f.asserter);
+    push_nonce(&f.asserter, 0);
+    push_sent(&f.asserter);
+    push_balances(&f.asserter, 2, ETH);
+    f.engine.on_block(head(15), 15).await;
+    assert!(f.engine.pending[0].cancel.is_some());
+    assert!(f.asserter.read_q().is_empty());
+  }
+
+  /// A forward is refused when its gas cost at the signed fee cap passes `max_gas_cost`,
+  /// even though the expected fee would fit.
+  #[tokio::test]
+  async fn forward_cost_checked_at_fee_cap() {
+    let mut f = fixture("forward-cap", 2, 16).await;
+    f.engine.live.max_gas_cost = gas_cost(TRANSFER_GAS, 21 * GWEI) - wei(1);
+    let forward = TxRequest {
+      from: 1,
+      to: treasury(),
+      value: wei(ETH),
+      data: Bytes::new(),
+      kind: EntryKind::Forward,
+    };
+    assert!(!f.engine.queue(forward.clone()));
+    assert!(f.engine.pending.is_empty());
+    f.engine.live.max_gas_cost = gas_cost(TRANSFER_GAS, 21 * GWEI);
+    assert!(f.engine.queue(forward));
+    assert_eq!(f.engine.pending.len(), 1);
   }
 }

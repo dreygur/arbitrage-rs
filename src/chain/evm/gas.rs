@@ -20,6 +20,8 @@ const OUT_OF_GAS_SLACK: u64 = 64;
 
 /// The base fee of the block after one with `parent_base_fee`, `gas_used` and `gas_limit`,
 /// by the EIP 1559 formula: a full block raises it 12.5%, an empty one lowers it 12.5%.
+/// It saturates rather than failing: an absurd forecast can only push `fee_per_gas` to
+/// `None`, which refuses sends.
 pub fn next_base_fee(parent_base_fee: u128, gas_used: u64, gas_limit: u64) -> u128 {
   let target = gas_limit / ELASTICITY;
   if target == 0 || gas_used == target {
@@ -38,7 +40,8 @@ pub fn next_base_fee(parent_base_fee: u128, gas_used: u64, gas_limit: u64) -> u1
 }
 
 /// A transaction's fee cap: `min(2 * next_base_fee + priority_fee, max_fee_per_gas * 10 / 11)`,
-/// so a cancel bumped 10% over it still fits under `max_fee_per_gas`.
+/// so a cancel bumped 10% over it still fits under `max_fee_per_gas`. Saturating is safe:
+/// the result never exceeds the ceiling.
 pub fn fee_cap(next_base_fee: u128, evm: &EvmConfig) -> u128 {
   let ceiling = Amount::from(evm.max_fee_per_gas) * Amount::from(BUMP.1) / Amount::from(BUMP.0);
   let ceiling = u128::try_from(ceiling).unwrap_or(u128::MAX);
@@ -56,13 +59,15 @@ pub fn fee_per_gas(next_base_fee: u128, evm: &EvmConfig) -> Option<u128> {
     .filter(|fee| *fee <= fee_cap(next_base_fee, evm))
 }
 
-/// `fee` raised by the 10% a replacement needs, rounded up.
+/// `fee` raised by the 10% a replacement needs, rounded up. It saturates at `u128::MAX`,
+/// unreachable for a fee that [`fee_cap`] bounded.
 pub fn bump(fee: u128) -> u128 {
   let raised = (Amount::from(fee) * Amount::from(BUMP.0)).div_ceil(Amount::from(BUMP.1));
   u128::try_from(raised).unwrap_or(u128::MAX)
 }
 
-/// Gas cost of `gas_limit` at `fee` per gas, in wei.
+/// Gas cost of `gas_limit` at `fee` per gas, in wei. A `u64` times a `u128` cannot overflow
+/// a `U256`; were it to saturate, the cost would pass any `max_gas_cost` and refuse the send.
 pub fn gas_cost(gas_limit: u64, fee: u128) -> Amount {
   Amount::from(gas_limit).saturating_mul(Amount::from(fee))
 }
@@ -73,7 +78,8 @@ pub fn out_of_gas(gas_used: u64, gas_limit: u64) -> bool {
   gas_used >= gas_limit - gas_limit / OUT_OF_GAS_SLACK
 }
 
-/// `value * ratio.0 / ratio.1`, rounded down and saturating at `u64::MAX`.
+/// `value * ratio.0 / ratio.1`, rounded down and saturating at `u64::MAX`, which the
+/// `max_gas_limit` cap applied after it brings back down.
 fn scale(value: u64, ratio: (u64, u64)) -> u64 {
   let scaled = u128::from(value) * u128::from(ratio.0) / u128::from(ratio.1);
   u64::try_from(scaled).unwrap_or(u64::MAX)
