@@ -14,9 +14,13 @@ const HEADROOM: (u64, u64) = (6, 5);
 const OUT_OF_GAS_RAISE: (u64, u64) = (3, 2);
 /// Replacement fee bump nodes require, as `11 / 10` (10%).
 const BUMP: (u128, u128) = (11, 10);
-/// Share of the limit a revert must use to count as out of gas: within `1 / 64` of it, the
-/// part a call frame keeps back under EIP 150.
+/// The share a call frame keeps back from the call it makes under EIP 150, `1 / 64`.
 const OUT_OF_GAS_SLACK: u64 = 64;
+/// Calls between a trade transaction and its deepest frame: the executor calls the
+/// PoolManager, which calls back into the executor, which calls a pool, which calls a token
+/// (or the PoolManager again), and one more for margin. Each keeps back its `1 / 64`, so a
+/// trade that runs out of gas at the bottom leaves that much of the limit unused.
+const CALL_DEPTH: u32 = 5;
 
 /// The base fee of the block after one with `parent_base_fee`, `gas_used` and `gas_limit`,
 /// by the EIP 1559 formula: a full block raises it 12.5%, an empty one lowers it 12.5%.
@@ -73,9 +77,10 @@ pub fn gas_cost(gas_limit: u64, fee: u128) -> Amount {
 }
 
 /// Whether a reverted transaction that used `gas_used` of `gas_limit` ran out of gas: it used
-/// all but at most the `1 / 64` a call frame holds back.
+/// all but at most what [`CALL_DEPTH`] nested frames hold back, `1 / 64` of what each had.
 pub fn out_of_gas(gas_used: u64, gas_limit: u64) -> bool {
-  gas_used >= gas_limit - gas_limit / OUT_OF_GAS_SLACK
+  let reachable = (0..CALL_DEPTH).fold(gas_limit, |gas, _| gas - gas / OUT_OF_GAS_SLACK);
+  gas_used >= reachable
 }
 
 /// `value * ratio.0 / ratio.1`, rounded down and saturating at `u64::MAX`, which the
@@ -239,5 +244,19 @@ mod tests {
     gas.record(0, 370_000, 375_000, true);
     assert_eq!(gas.limit(0), 562_500);
     assert_eq!(gas.limit(1), 300_000);
+  }
+
+  /// A revert that ran out of gas several call frames deep counts as out of gas, though each
+  /// frame held back its 1/64: the fork receipt of a V2 against V2 trade used 243,206 of
+  /// 250,000. A revert well short of the limit still teaches nothing.
+  #[test]
+  fn nested_out_of_gas_raises_limit() {
+    assert!(out_of_gas(243_206, 250_000));
+    assert!(!out_of_gas(220_000, 250_000));
+    let mut gas = GasLimits::new(&mock_evm_config());
+    gas.record(0, 220_000, 250_000, true);
+    assert_eq!(gas.limit(0), 250_000);
+    gas.record(0, 243_206, 250_000, true);
+    assert_eq!(gas.limit(0), 375_000);
   }
 }
