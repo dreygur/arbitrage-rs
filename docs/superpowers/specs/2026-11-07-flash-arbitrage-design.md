@@ -270,8 +270,11 @@ tick data provider errors outside that window, so a quote never assumes
 empty liquidity beyond it. The SDK's quote is `async` only because its
 tick provider trait is; ours answers from memory, so the quote is
 polled once with `now_or_never()` inside the synchronous `quote_out`.
-The SDK cannot price a protocol fee, so pools with a non zero protocol
-fee are skipped with a warning. Native ETH and WETH are one asset to the
+The SDK has no protocol fee input, so a pool with a non zero protocol
+fee is priced per direction with the fee the PoolManager charges:
+`swap_fee = protocol + lp - protocol * lp / 1_000_000` in pips, where
+`protocol` is the low 12 bits of `protocolFee` for zero for one and the
+high 12 bits for one for zero (Uniswap's `ProtocolFeeLibrary`). Native ETH and WETH are one asset to the
 core: the adapter reports native as the WETH id and remembers each
 pool's real currency for the executor.
 
@@ -571,6 +574,11 @@ the config names.
 - Venue implementations live in the adapter; traits in the core.
 - Chain neutral core with an EVM adapter now; Solana later.
 - Work lands on a feature branch through a PR; Foundry removed at the end.
+- V4 pools with a protocol fee are priced with the combined swap fee
+  per direction instead of skipped: by November 2026 every hookless
+  WETH pool for the listed tokens carries one, so skipping them left no
+  V4 venue. A pricing error costs only a `NoProfit` revert, since the
+  executor checks profit on chain.
 
 ## Open implementation choices
 
