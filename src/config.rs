@@ -446,7 +446,7 @@ mod tests {
   #[test]
   fn diff_restart_for_adapter_change() {
     let old = NetworkConfig::parse(ETHEREUM, "ethereum").unwrap();
-    let new = edited("gas_v2_v2 = 250000", "gas_v2_v2 = 260000").unwrap();
+    let new = edited("gas_v2_v2 = 350000", "gas_v2_v2 = 360000").unwrap();
     assert_eq!(old.diff(1, &new, 1), Change::Restart);
   }
 
