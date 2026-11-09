@@ -6,7 +6,6 @@ use std::str::FromStr;
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, U160, U256};
 use alloy::providers::Provider;
-use tracing::warn;
 
 use crate::chain::evm::bindings::{Call3, IStateView, IUniswapV2Factory, IUniswapV2Pair};
 use crate::chain::evm::config::{EvmConfig, Family};
@@ -185,8 +184,8 @@ fn probes(evm: &EvmConfig, base: Address, token: Address) -> Vec<(Tracked, Call3
 
 /// Probes every venue for pools pairing `base` with each of `tokens`, in one batch.
 ///
-/// A V2 pool is kept when the factory knows the pair, a V4 pool when its price is set; a V4
-/// pool with a protocol fee is skipped with a warning since the SDK cannot price it.
+/// A V2 pool is kept when the factory knows the pair, a V4 pool when its price is set,
+/// protocol fee or not: the venue prices that fee per direction.
 async fn probe<P: Provider>(
   provider: &P,
   evm: &EvmConfig,
@@ -235,10 +234,6 @@ async fn probe<P: Provider>(
           continue;
         };
         if slot0.sqrtPriceX96.is_zero() {
-          continue;
-        }
-        if !slot0.protocolFee.is_zero() {
-          warn!(pool = %tracked.id(), fee = %slot0.protocolFee, "skipping v4 pool with a protocol fee");
           continue;
         }
         found.push(Candidate {
@@ -523,8 +518,8 @@ mod tests {
     );
   }
 
-  /// A listed token found on both venues is kept: the V2 pair and the one priced V4 key
-  /// without a protocol fee; unpriced, reverted and protocol fee keys are dropped.
+  /// A listed token found on both venues is kept: the V2 pair and both priced V4 keys, the
+  /// one with a protocol fee included; unpriced and reverted keys are dropped.
   #[tokio::test]
   async fn listed_finds_pools_on_two_venues() {
     let asserter = Asserter::new();
@@ -553,17 +548,23 @@ mod tests {
           &reserves,
         )),
         Some(IStateView::getLiquidityCall::abi_encode_returns(&L)),
+        Some(IStateView::getLiquidityCall::abi_encode_returns(&L)),
       ],
     );
     let found = listed(&mock_provider(&asserter), &network(), &mock_evm_config())
       .await
       .unwrap();
-    let key = V4Key {
+    let charging = V4Key {
       currency0: Address::ZERO,
       currency1: token(),
+      fee: 500,
+      tick_spacing: 10,
+      hooks: Address::ZERO,
+    };
+    let key = V4Key {
       fee: 3000,
       tick_spacing: 60,
-      hooks: Address::ZERO,
+      ..charging
     };
     assert_eq!(
       found,
@@ -574,6 +575,10 @@ mod tests {
           token0: token(),
           token1: weth(),
           fee_bps: 30,
+        },
+        Tracked::V4 {
+          venue: 1,
+          key: charging,
         },
         Tracked::V4 { venue: 1, key },
       ]

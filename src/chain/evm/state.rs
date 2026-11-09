@@ -73,6 +73,8 @@ enum Head {
     liquidity: u128,
     /// Decimals of currency zero and one.
     decimals: (u8, u8),
+    /// Slot0's packed protocol fee, both directions.
+    protocol_fees: u32,
   },
 }
 
@@ -100,8 +102,8 @@ fn head_calls(pool: &Tracked, state_view: Address) -> Vec<Call3> {
   }
 }
 
-/// Decodes the answers to `head_calls(pool)`, failing for a reverted read, a V4 protocol fee
-/// (the SDK cannot price it) or an unset V4 price.
+/// Decodes the answers to `head_calls(pool)`, failing for a reverted read or an unset V4
+/// price.
 fn decode_head(pool: &Tracked, venue: &EvmVenue, results: &[Result3]) -> Result<Head> {
   match *pool {
     Tracked::V2 {
@@ -135,12 +137,6 @@ fn decode_head(pool: &Tracked, venue: &EvmVenue, results: &[Result3]) -> Result<
           *places = decode::<IERC20::decimalsCall>(result)?;
         }
       }
-      if !slot0.protocolFee.is_zero() {
-        return Err(Error::Config(format!(
-          "protocol fee {} cannot be priced",
-          slot0.protocolFee
-        )));
-      }
       if slot0.sqrtPriceX96.is_zero() {
         return Err(Error::Config("price is not set".into()));
       }
@@ -149,6 +145,7 @@ fn decode_head(pool: &Tracked, venue: &EvmVenue, results: &[Result3]) -> Result<
         tick: slot0.tick.as_i32(),
         liquidity,
         decimals: (decimals[0], decimals[1]),
+        protocol_fees: slot0.protocolFee.to::<u32>(),
       })
     }
   }
@@ -158,7 +155,7 @@ fn decode_head(pool: &Tracked, venue: &EvmVenue, results: &[Result3]) -> Result<
 /// and the tick window for V4.
 ///
 /// Three batches in all, every V4 window read together. Each pool stands alone: a failed or
-/// undecodable read, a protocol fee, an unset price or a key the SDK refuses skips that pool
+/// undecodable read, an unset price or a key the SDK refuses skips that pool
 /// with a warning naming it, so a reload drops a pool that went bad. Only a failed request
 /// fails the whole read.
 async fn read_pools<P: Provider>(
@@ -208,6 +205,7 @@ async fn read_pools<P: Provider>(
           tick,
           liquidity,
           decimals,
+          protocol_fees,
         },
         Tracked::V4 { key, venue },
       ) => windows
@@ -219,6 +217,7 @@ async fn read_pools<P: Provider>(
             pool.id(),
             base_id.clone(),
             key,
+            protocol_fees,
             decimals,
             sqrt_price,
             liquidity,
@@ -487,6 +486,7 @@ pub(crate) mod tests {
 
   use crate::chain::evm::venue::v4::V4Key;
   use crate::testkit::{mock_evm_config, mock_provider, push_multicall};
+  use crate::types::Side;
 
   /// Liquidity of the V4 test pool's one position.
   pub(crate) const L: u128 = 10_000_000_000;
@@ -569,7 +569,7 @@ pub(crate) mod tests {
   }
 
   /// Queues the answers a load reads, shaped by `answers`: block number, the pool batch, and
-  /// the tick window batches (one position over -600..600) unless the V4 pool is skipped.
+  /// the tick window batches (one position over -600..600).
   pub(crate) fn push_load(asserter: &Asserter, answers: Answers) {
     asserter.push_success(&U64::from(answers.block));
     let protocol_fee = answers.protocol_fee;
@@ -595,9 +595,6 @@ pub(crate) mod tests {
         Some(IERC20::decimalsCall::abi_encode_returns(&18u8)),
       ],
     );
-    if protocol_fee != 0 {
-      return;
-    }
     let bitmap =
       |bit: usize| IStateView::getTickBitmapCall::abi_encode_returns(&(U256::from(1u8) << bit));
     push_multicall(
@@ -911,17 +908,32 @@ pub(crate) mod tests {
     assert_eq!(described(&state), before);
   }
 
-  /// A V4 pool with a protocol fee is left out of the loaded state.
+  /// A V4 pool with a protocol fee is loaded and priced at the combined swap fee: one sided
+  /// here, so only zero for one pays more than a pool without it.
   #[tokio::test]
-  async fn protocol_fee_pool_skipped() {
+  async fn protocol_fee_pool_loaded() {
     let state = load_with(Answers {
       protocol_fee: 100,
       ..GOOD
     })
     .await;
+    let plain = loaded().await;
     assert_eq!(
       described(&state),
-      vec!["uniswap_v2 30bps r0=1000000 r1=2000000"]
+      vec![
+        "uniswap_v2 30bps r0=1000000 r1=2000000".to_string(),
+        format!("uniswap_v4 30bps pf=0x64 p={} L={L} t=0", price_at(0)),
+      ]
+    );
+    let quote = |state: &State, side: Side| {
+      state.snapshots()[1]
+        .quote_out(Amount::from(1_000_000u64), side)
+        .unwrap()
+    };
+    assert!(quote(&state, Side::ZeroForOne) < quote(&plain, Side::ZeroForOne));
+    assert_eq!(
+      quote(&state, Side::OneForZero),
+      quote(&plain, Side::OneForZero)
     );
   }
 

@@ -25,6 +25,13 @@ const MAX_FEE: u32 = 1_000_000;
 const PIPS_PER_BPS: u32 = 100;
 /// Fractional bits of a Q64.96 square root price.
 const Q96_BITS: usize = 96;
+/// Pips in a whole, the denominator of every V4 fee.
+const PIPS: u32 = 1_000_000;
+/// Bits of one direction's protocol fee in slot0's packed value: zero for one in the low
+/// twelve, one for zero in the next twelve.
+const PROTOCOL_FEE_BITS: u32 = 12;
+/// Mask of one direction's protocol fee.
+const PROTOCOL_FEE_MASK: u32 = (1 << PROTOCOL_FEE_BITS) - 1;
 /// Tick spacing of the V4 fixture.
 #[cfg(any(test, feature = "testkit"))]
 const FIXTURE_SPACING: i32 = 60;
@@ -91,6 +98,24 @@ fn currency(address: Address, decimals: u8) -> Currency {
   }
 }
 
+/// The protocol fee in pips a swap in direction `side` pays, out of slot0's `packed` value:
+/// the low 12 bits for zero for one, the high 12 for one for zero.
+pub fn protocol_fee(packed: u32, side: Side) -> u32 {
+  match side {
+    Side::ZeroForOne => packed & PROTOCOL_FEE_MASK,
+    Side::OneForZero => (packed >> PROTOCOL_FEE_BITS) & PROTOCOL_FEE_MASK,
+  }
+}
+
+/// The fee in pips the PoolManager charges a swap with `protocol` and `lp` fees:
+/// `protocol + lp - protocol * lp / 1_000_000`, rounded down as Uniswap's
+/// `ProtocolFeeLibrary.calculateSwapFee` does. The protocol fee fits 12 bits and the LP fee
+/// is below a whole, so nothing overflows.
+pub fn swap_fee(protocol: u32, lp: u32) -> u32 {
+  let cut = u64::from(protocol) * u64::from(lp) / u64::from(PIPS);
+  protocol + lp - u32::try_from(cut).unwrap_or(protocol)
+}
+
 /// Id the core sees for `address`: `base_alias` for native, else the address.
 pub fn token_id(address: Address, base_alias: &Id) -> Id {
   if address == Address::ZERO {
@@ -136,23 +161,33 @@ pub struct V4Pool {
   base_first: bool,
   /// The pool key, kept for its fee and tick spacing.
   key: V4Key,
-  /// SDK pool holding price, liquidity, current tick and the tick window.
+  /// Slot0's packed protocol fee, zero for most pools.
+  protocol_fees: u32,
+  /// SDK pool holding price, liquidity, current tick and the tick window, priced at the zero
+  /// for one swap fee. Its own pool id follows that fee, so `pool` is the id used everywhere.
   sdk: Pool<BoundedTicks>,
+  /// The same pool priced at the one for zero swap fee, present only when that differs from
+  /// the zero for one fee; every state change is applied to both.
+  one_for_zero: Option<Pool<BoundedTicks>>,
 }
 
 impl V4Pool {
-  /// Builds a pool from its key, decimals, slot0, liquidity and tick window.
+  /// Builds a pool from its key, slot0's packed `protocol_fees`, decimals, slot0, liquidity
+  /// and tick window.
   ///
   /// `base_alias` is the id reported for native currency (the wrapped native token), and the
-  /// side that holds it is the base side. Fails for keys the SDK cannot price (unsorted
-  /// currencies, a non positive tick spacing or a fee that is not a static LP fee) and for
-  /// pools where neither currency is native or `base_alias`.
+  /// side that holds it is the base side. Each direction is priced at the swap fee the
+  /// PoolManager charges, the LP fee combined with that direction's protocol fee. Fails for
+  /// keys the SDK cannot price (unsorted currencies, a non positive tick spacing or a fee
+  /// that is not a static LP fee) and for pools where neither currency is native or
+  /// `base_alias`.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     venue: String,
     pool: Id,
     base_alias: Id,
     key: V4Key,
+    protocol_fees: u32,
     decimals: (u8, u8),
     sqrt_price_x96: U160,
     liquidity: u128,
@@ -177,18 +212,35 @@ impl V4Pool {
         key.fee
       )));
     }
-    let mut sdk = Pool::new_with_tick_data_provider(
-      currency(key.currency0, decimals.0),
-      currency(key.currency1, decimals.1),
-      U24::from(key.fee),
-      key.tick_spacing,
-      key.hooks,
-      sqrt_price_x96,
-      liquidity,
-      ticks,
-    )
-    .map_err(|e| Error::Config(format!("v4 pool {pool}: {e}")))?;
-    sdk.tick_current = tick;
+    let priced = |side: Side| -> Result<Pool<BoundedTicks>> {
+      let fee = swap_fee(protocol_fee(protocol_fees, side), key.fee);
+      if fee >= MAX_FEE {
+        return Err(Error::Config(format!(
+          "v4 swap fee {fee} is not below a whole"
+        )));
+      }
+      let mut sdk = Pool::new_with_tick_data_provider(
+        currency(key.currency0, decimals.0),
+        currency(key.currency1, decimals.1),
+        U24::from(fee),
+        key.tick_spacing,
+        key.hooks,
+        sqrt_price_x96,
+        liquidity,
+        ticks.clone(),
+      )
+      .map_err(|e| Error::Config(format!("v4 pool {pool}: {e}")))?;
+      sdk.tick_current = tick;
+      Ok(sdk)
+    };
+    let sdk = priced(Side::ZeroForOne)?;
+    let one_for_zero = if protocol_fee(protocol_fees, Side::ZeroForOne)
+      == protocol_fee(protocol_fees, Side::OneForZero)
+    {
+      None
+    } else {
+      Some(priced(Side::OneForZero)?)
+    };
     let token0 = token_id(key.currency0, &base_alias);
     let token1 = token_id(key.currency1, &base_alias);
     if token0 != base_alias && token1 != base_alias {
@@ -203,15 +255,32 @@ impl V4Pool {
       token0,
       token1,
       key,
+      protocol_fees,
       sdk,
+      one_for_zero,
     })
+  }
+
+  /// Every SDK pool this pool holds, so a state change reaches each direction's pricing.
+  fn sdk_pools(&mut self) -> impl Iterator<Item = &mut Pool<BoundedTicks>> {
+    std::iter::once(&mut self.sdk).chain(self.one_for_zero.as_mut())
+  }
+
+  /// The SDK pool priced for a swap in direction `side`.
+  fn priced_for(&self, side: Side) -> &Pool<BoundedTicks> {
+    match (side, &self.one_for_zero) {
+      (Side::OneForZero, Some(pool)) => pool,
+      _ => &self.sdk,
+    }
   }
 
   /// Applies a `Swap` event: the new price, in range liquidity and current tick.
   pub fn apply_swap(&mut self, sqrt_price: U160, liquidity: u128, tick: i32) {
-    self.sdk.sqrt_price_x96 = sqrt_price;
-    self.sdk.liquidity = liquidity;
-    self.sdk.tick_current = tick;
+    for sdk in self.sdk_pools() {
+      sdk.sqrt_price_x96 = sqrt_price;
+      sdk.liquidity = liquidity;
+      sdk.tick_current = tick;
+    }
   }
 
   /// Applies a `ModifyLiquidity` event of `delta` over `[tick_lower, tick_upper)`.
@@ -230,14 +299,18 @@ impl V4Pool {
     if tick_lower <= tick && tick < tick_upper {
       liquidity = liquidity.checked_add_signed(delta).ok_or(Error::Overflow)?;
     }
-    self.sdk.tick_data_provider = ticks;
-    self.sdk.liquidity = liquidity;
+    for sdk in self.sdk_pools() {
+      sdk.tick_data_provider = ticks.clone();
+      sdk.liquidity = liquidity;
+    }
     Ok(())
   }
 
   /// Replaces the tick window with a freshly fetched one.
   pub fn replace_window(&mut self, ticks: BoundedTicks) {
-    self.sdk.tick_data_provider = ticks;
+    for sdk in self.sdk_pools() {
+      sdk.tick_data_provider = ticks.clone();
+    }
   }
 
   /// Whether the current tick is within one bitmap word of the window's edge.
@@ -272,7 +345,8 @@ impl Venue for V4Pool {
     [&self.token0, &self.token1]
   }
 
-  /// Exact input quote from the SDK over the tick window.
+  /// Exact input quote from the SDK over the tick window, at the swap fee of direction
+  /// `side`.
   ///
   /// The tick provider answers from memory, so the SDK's future completes on its first poll.
   /// A pending future, an SDK error or a swap that would leave the window is
@@ -281,32 +355,33 @@ impl Venue for V4Pool {
     if amount_in.bit(255) {
       return Err(Error::Overflow);
     }
-    let price = self.sdk.sqrt_price_x96;
+    let sdk = self.priced_for(side);
+    let price = sdk.sqrt_price_x96;
     let (currency, at_limit) = match side {
-      Side::ZeroForOne => (
-        &self.sdk.currency0,
-        price <= MIN_SQRT_RATIO + U160::from(1u8),
-      ),
-      Side::OneForZero => (
-        &self.sdk.currency1,
-        price >= MAX_SQRT_RATIO - U160::from(1u8),
-      ),
+      Side::ZeroForOne => (&sdk.currency0, price <= MIN_SQRT_RATIO + U160::from(1u8)),
+      Side::OneForZero => (&sdk.currency1, price >= MAX_SQRT_RATIO - U160::from(1u8)),
     };
     if at_limit {
       return Err(Error::InsufficientLiquidity);
     }
     let input = CurrencyAmount::from_raw_amount(currency.clone(), amount_in.to_big_int())
       .map_err(|_| Error::Overflow)?;
-    match self.sdk.get_output_amount(&input, None).now_or_never() {
+    match sdk.get_output_amount(&input, None).now_or_never() {
       Some(Ok((output, _))) => Ok(Amount::from_big_int(output.quotient())),
       _ => Err(Error::InsufficientLiquidity),
     }
   }
 
-  /// Venue name, fee, price, liquidity and tick.
+  /// Venue name, LP fee, price, liquidity and tick, with slot0's packed protocol fee when the
+  /// pool charges one.
   fn describe(&self) -> String {
+    let protocol = if self.protocol_fees == 0 {
+      String::new()
+    } else {
+      format!(" pf={:#x}", self.protocol_fees)
+    };
     format!(
-      "{} {}bps p={} L={} t={}",
+      "{} {}bps{protocol} p={} L={} t={}",
       self.venue,
       self.key.fee / PIPS_PER_BPS,
       self.sdk.sqrt_price_x96,
@@ -338,6 +413,7 @@ pub fn v4_fixture_quoting(quote: Address) -> V4Pool {
     Id::new(key.pool_id().to_vec()),
     Id::new(b"base".to_vec()),
     key,
+    0,
     (18, 18),
     FIXTURE_SQRT_PRICE,
     FIXTURE_LIQUIDITY,
@@ -398,14 +474,22 @@ mod tests {
     get_sqrt_ratio_at_tick(tick.to_i24()).unwrap()
   }
 
-  /// Pool at `tick` with `ticks`, a window of `words` words and in range `liquidity`.
-  fn build(ticks: Vec<Tick>, liquidity: u128, tick: i32, words: u16) -> V4Pool {
+  /// Pool at `tick` with `ticks`, a window of `words` words, in range `liquidity` and the
+  /// packed `protocol_fees` slot0 reports.
+  fn build_charging(
+    ticks: Vec<Tick>,
+    liquidity: u128,
+    tick: i32,
+    words: u16,
+    protocol_fees: u32,
+  ) -> V4Pool {
     let (lower, upper) = BoundedTicks::bounds(tick, SPACING, words);
     V4Pool::new(
       "uniswap_v4".into(),
       Id::new(key().pool_id().to_vec()),
       weth(),
       key(),
+      protocol_fees,
       (18, 18),
       price_at(tick),
       liquidity,
@@ -415,12 +499,28 @@ mod tests {
     .unwrap()
   }
 
+  /// Pool at `tick` with `ticks`, a window of `words` words, in range `liquidity` and no
+  /// protocol fee.
+  fn build(ticks: Vec<Tick>, liquidity: u128, tick: i32, words: u16) -> V4Pool {
+    build_charging(ticks, liquidity, tick, words, 0)
+  }
+
   /// SDK pool over the same ticks with no window, the reference our quotes must match.
   fn reference(ticks: Vec<Tick>, liquidity: u128, tick: i32) -> Pool<TickListDataProvider> {
+    reference_at_fee(ticks, liquidity, tick, 3000)
+  }
+
+  /// [`reference`] priced at `fee` pips.
+  fn reference_at_fee(
+    ticks: Vec<Tick>,
+    liquidity: u128,
+    tick: i32,
+    fee: u32,
+  ) -> Pool<TickListDataProvider> {
     Pool::new_with_tick_data_provider(
       Currency::NativeCurrency(Ether::on_chain(SDK_CHAIN_ID)),
       Currency::Token(Token::new(SDK_CHAIN_ID, token(), 18, None, None, 0, 0)),
-      U24::from(3000),
+      U24::from(fee),
       SPACING,
       Address::ZERO,
       price_at(tick),
@@ -459,6 +559,70 @@ mod tests {
         assert_eq!(ours, reference_quote(&reference, amount, side).unwrap());
         assert!(amount < 2 || ours > Amount::ZERO);
       }
+    }
+  }
+
+  /// The swap fee is `protocol + lp - protocol * lp / 1_000_000`, with the zero for one
+  /// protocol fee in the low 12 bits of slot0's value and the one for zero fee in the high 12.
+  #[test]
+  fn swap_fee_combines_protocol_and_lp() {
+    assert_eq!(protocol_fee(0x032032, Side::ZeroForOne), 50);
+    assert_eq!(protocol_fee(0x032032, Side::OneForZero), 50);
+    assert_eq!(swap_fee(50, 500), 550);
+    assert_eq!(swap_fee(1000, 10_000), 10_990);
+    assert_eq!(swap_fee(125, 500), 625);
+    assert_eq!(swap_fee(0, 3000), 3000);
+    let one_sided = 0x0003e8;
+    assert_eq!(protocol_fee(one_sided, Side::ZeroForOne), 1000);
+    assert_eq!(protocol_fee(one_sided, Side::OneForZero), 0);
+    let both = (1000 << 12) | 100;
+    assert_eq!(protocol_fee(both, Side::ZeroForOne), 100);
+    assert_eq!(protocol_fee(both, Side::OneForZero), 1000);
+  }
+
+  /// A pool with a protocol fee quotes each direction as the SDK does at that direction's
+  /// combined fee, whether the fee is the same both ways, one sided or different per side.
+  #[test]
+  fn protocol_fee_pool_quotes_at_swap_fee() {
+    let amount = 20_000_000_000_000_000u128;
+    for packed in [0x1f41f4, 0x0003e8, (1000 << 12) | 100] {
+      let pool = build_charging(position(-600, 600, L), L, 0, 2, packed);
+      for side in [Side::ZeroForOne, Side::OneForZero] {
+        let fee = swap_fee(protocol_fee(packed, side), 3000);
+        let reference = reference_at_fee(position(-600, 600, L), L, 0, fee);
+        assert_eq!(
+          pool.quote_out(Amount::from(amount), side).unwrap(),
+          reference_quote(&reference, amount, side).unwrap(),
+          "packed {packed:#x} {side:?}"
+        );
+      }
+    }
+    let plain = build(position(-600, 600, L), L, 0, 2);
+    let charged = build_charging(position(-600, 600, L), L, 0, 2, 0x0003e8);
+    let small = Amount::from(amount);
+    assert!(
+      charged.quote_out(small, Side::ZeroForOne).unwrap()
+        < plain.quote_out(small, Side::ZeroForOne).unwrap()
+    );
+    assert_eq!(
+      charged.quote_out(small, Side::OneForZero).unwrap(),
+      plain.quote_out(small, Side::OneForZero).unwrap()
+    );
+  }
+
+  /// State changes reach both directions of a pool whose fees differ per side.
+  #[test]
+  fn protocol_fee_pool_follows_swaps() {
+    let packed = 0x0003e8;
+    let mut pool = build_charging(position(-600, 600, L), L, 0, 2, packed);
+    pool.apply_swap(price_at(-300), L, -300);
+    let fresh = build_charging(position(-600, 600, L), L, -300, 2, packed);
+    let amount = Amount::from(1_000_000_000_000_000u64);
+    for side in [Side::ZeroForOne, Side::OneForZero] {
+      assert_eq!(
+        pool.quote_out(amount, side).unwrap(),
+        fresh.quote_out(amount, side).unwrap()
+      );
     }
   }
 
@@ -587,6 +751,7 @@ mod tests {
         currency1: Address::repeat_byte(0x22),
         ..key()
       },
+      0,
       (18, 18),
       price_at(0),
       L,
@@ -616,6 +781,7 @@ mod tests {
       Id::new(vec![1; 32]),
       weth(),
       key(),
+      0,
       (18, 18),
       sqrt,
       L,
@@ -634,6 +800,7 @@ mod tests {
         currency1: wrapped,
         ..key()
       },
+      0,
       (6, 18),
       sqrt,
       L,
