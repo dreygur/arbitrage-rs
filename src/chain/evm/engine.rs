@@ -1373,8 +1373,10 @@ impl<P: Provider> Engine<P> {
     }
   }
 
-  /// Starts the engine task: it reads every lane's nonce, then runs commands in order and
-  /// publishes after each one. The task ends when every command sender is dropped.
+  /// Starts the engine task: it reads every lane's nonce and the balances at the latest
+  /// block, so the first block's trades are not refused as `LowGas` on balances never read,
+  /// then runs commands in order and publishes after each one. The task ends when every
+  /// command sender is dropped.
   ///
   /// The command channel is unbounded so that a sender never waits and commands from the
   /// bot's synchronous calls (pause, live settings) keep their order; the chain sends a
@@ -1387,6 +1389,7 @@ impl<P: Provider> Engine<P> {
     let (published, subscriber) = watch::channel(self.snapshot());
     tokio::spawn(async move {
       self.sync_lanes().await;
+      self.read_balances(BlockId::latest()).await;
       published.send_replace(self.snapshot());
       while let Some(command) = receiver.recv().await {
         self.handle(command).await;
@@ -2012,13 +2015,23 @@ mod tests {
     assert_eq!(weth_gain(&losing, weth(), executor()), None);
   }
 
-  /// The published values follow blocks and trades.
+  /// The published values follow blocks and trades, starting from balances read at spawn,
+  /// so no lane looks unfunded before the first block's maintenance.
   #[tokio::test]
   async fn published_values_update() {
     let f = fixture("published", 2, 16).await;
     let asserter = f.asserter.clone();
+    push_balances(&asserter, 2, 2 * ETH);
     let (commands, mut published) = f.engine.spawn();
-    let first = published.borrow_and_update().clone();
+    let first = tokio::time::timeout(
+      Duration::from_secs(5),
+      published.wait_for(|p| p.status.accounts[1].eth == wei(2 * ETH)),
+    )
+    .await
+    .expect("balances not read at spawn")
+    .unwrap()
+    .clone();
+    assert!(!first.status.accounts[1].low_gas);
     assert_eq!(first.gas_limits, [250_000, 300_000, 350_000]);
     assert_eq!(first.fee_per_gas, Some(11 * GWEI));
     assert_eq!(first.in_flight, 0);
