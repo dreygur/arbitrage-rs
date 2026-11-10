@@ -36,6 +36,11 @@ const HIGH_BASE_FEE: u128 = 200_000_000_000;
 const FRONT_RUN_TIP: u128 = 50_000_000_000;
 /// Executor WETH the sweep test starts with, under the default `executor_max_hold`.
 const SWEEP_SEED: U256 = U256::from_limbs([500_000_000_000_000_000, 0, 0, 0]);
+/// USDC sold into a V4 pool to check the quote opposite to WETH in, 2,000 USDC.
+const USDC_IN: u64 = 2_000_000_000;
+/// Factory pairs discovery scans in its test, small enough to finish inside the public
+/// node's state window.
+const DISCOVERY_SCAN: u64 = 50;
 /// Bytes in a V2 pool id (a pair address).
 const V2_ID_LEN: usize = 20;
 /// Bytes in a V4 pool id.
@@ -155,27 +160,43 @@ async fn v2_quote_matches_router() {
   .await;
 }
 
-/// The local V4 quote of one WETH on the deepest WETH/USDC V4 pool equals the V4Quoter's.
+/// On the deepest WETH/USDC V4 pool, which charges a protocol fee, the local quotes of one
+/// WETH in and of [`USDC_IN`] in equal the V4Quoter's.
 #[tokio::test]
 #[ignore = "needs a running fork: make fork"]
 async fn v4_quote_matches_quoter() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
     let key = deepest_v4(&ctx, USDC).await;
-    let venue = venue(&ctx, &Id::new(key.pool_id().to_vec()));
-    let params = QuoteExactSingleParams {
-      poolKey: key.pool_key(),
-      zeroForOne: key.currency0 == Address::ZERO || key.currency0 == WETH,
-      exactAmount: ETHER.to::<u128>(),
-      hookData: Bytes::new(),
-    };
-    let quoted = IV4Quoter::new(QUOTER, &ctx.provider)
-      .quoteExactInputSingle(params)
+    let state_view = EvmConfig::parse(&ctx.cfg).unwrap().state_view;
+    let slot0 = IStateView::new(state_view, &ctx.provider)
+      .getSlot0(key.pool_id())
       .call()
       .await
-      .unwrap()
-      .amountOut;
-    assert_eq!(venue.quote_out(ETHER, base_side(&*venue)).unwrap(), quoted);
+      .unwrap();
+    assert!(!slot0.protocolFee.is_zero(), "pool charges no protocol fee");
+    let venue = venue(&ctx, &Id::new(key.pool_id().to_vec()));
+    let quoter = IV4Quoter::new(QUOTER, &ctx.provider);
+    let base_first = key.currency0 == Address::ZERO || key.currency0 == WETH;
+    let side = base_side(&*venue);
+    for (amount, zero_for_one, side) in [
+      (ETHER, base_first, side),
+      (U256::from(USDC_IN), !base_first, side.flip()),
+    ] {
+      let params = QuoteExactSingleParams {
+        poolKey: key.pool_key(),
+        zeroForOne: zero_for_one,
+        exactAmount: amount.to::<u128>(),
+        hookData: Bytes::new(),
+      };
+      let quoted = quoter
+        .quoteExactInputSingle(params)
+        .call()
+        .await
+        .unwrap()
+        .amountOut;
+      assert_eq!(venue.quote_out(amount, side).unwrap(), quoted, "{side:?}");
+    }
   })
   .await;
 }
@@ -464,14 +485,15 @@ async fn sweep_only_pays_treasury() {
   .await;
 }
 
-/// Discovery over SushiSwap's first 500 pairs connects and tracks pairs holding WETH.
+/// Discovery over SushiSwap's first [`DISCOVERY_SCAN`] pairs connects and tracks pairs
+/// holding WETH.
 #[tokio::test]
 #[ignore = "needs a running fork: make fork"]
 async fn discovers_pairs() {
   forked(|| async {
     let ctx = ctx(|cfg| {
       cfg.pairs.mode = PairMode::Discover;
-      cfg.pairs.max_scan = 500;
+      cfg.pairs.max_scan = DISCOVERY_SCAN;
     })
     .await;
     let base = to_id(WETH);
