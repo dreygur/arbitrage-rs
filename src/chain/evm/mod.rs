@@ -366,10 +366,12 @@ impl EvmChain {
     *self.snapshots.write().unwrap_or_else(|e| e.into_inner()) = state.snapshots();
   }
 
-  /// Applies `block` to `state`: a change that cannot be trusted reloads every pool, and a
-  /// feed gap also checks that the executor still has code, asking for a restart when it is
-  /// gone. Pools near their tick window's edge get a refetch, then the engine gets the head,
-  /// which it handles without RPC; its maintenance is held back until after the submit.
+  /// Applies `block` to `state`: a change that cannot be trusted reloads every pool. A feed
+  /// gap first checks that the executor still has code; when it is gone the chain asks for a
+  /// restart and skips the reload, since the chain is about to be rebuilt and rereading every
+  /// pool of a reset fork is the slow part. Pools near their tick window's edge get a
+  /// refetch, then the engine gets the head, which it handles without RPC; its maintenance is
+  /// held back until after the submit.
   ///
   /// The block counts as read once state reflects it, so a reload's time is in the read
   /// stage of a trade's latency rather than in the decision.
@@ -380,10 +382,11 @@ impl EvmChain {
     );
     let mut update = state.apply(&block);
     if update.reload {
-      reload(&self.provider, state).await;
       if block.gap && !has_code(&self.provider, self.executor).await {
         warn!(executor = %self.executor, "executor has no code after a feed gap, restarting");
         update.restart = true;
+      } else {
+        reload(&self.provider, state).await;
       }
     }
     *lock(&self.last_block) = Some((block.seen, Instant::now()));
@@ -669,36 +672,45 @@ mod tests {
     }
   }
 
-  /// After a gap the pools are reloaded, through a failed attempt, and an executor without
-  /// code asks for a restart.
+  /// After a gap the executor's code is read first, through a failed attempt, and missing
+  /// code asks for a restart without rereading any pool: the chain is about to be rebuilt,
+  /// and on a reset fork that reload is the slow part. The block number answer queued after
+  /// the code is the read a reload would start with, so it must stay unread.
   #[tokio::test(start_paused = true)]
   async fn missing_code_after_gap_requests_restart() {
     let mut h = harness(HashMap::new()).await;
     h.asserter.push_failure_msg("node down");
-    h.asserter.push_success(&U64::from(12));
     h.asserter.push_success(&Bytes::new());
+    h.asserter.push_success(&U64::from(12));
     h.feed
       .send(FeedEvent::Block(block(12, true)))
       .await
       .unwrap();
-    let update = h.chain.changes().await.unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), h.chain.changes())
+      .await
+      .expect("changes waited on a reload")
+      .unwrap();
     assert!(update.reload && update.restart, "{update:?}");
-    assert!(h.asserter.read_q().is_empty(), "answers left unread");
+    assert_eq!(h.asserter.read_q().len(), 1, "a pool reload ran");
     assert_eq!(applied(&mut h.commands), 12);
     assert!(h.chain.status().feed_lag_ms > 0);
   }
 
-  /// After a gap an executor that still has code keeps the chain running.
+  /// After a gap an executor that still has code keeps the chain running, its code read
+  /// before the pools are reloaded.
   #[tokio::test]
   async fn executor_with_code_survives_gap() {
     let mut h = harness(HashMap::new()).await;
-    h.asserter.push_success(&U64::from(12));
     h.asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    h.asserter.push_success(&U64::from(12));
     h.feed
       .send(FeedEvent::Block(block(12, true)))
       .await
       .unwrap();
-    let update = h.chain.changes().await.unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), h.chain.changes())
+      .await
+      .expect("changes hung on a misordered read")
+      .unwrap();
     assert!(update.reload && !update.restart, "{update:?}");
     assert_eq!(applied(&mut h.commands), 12);
   }
