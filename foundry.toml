@@ -1,0 +1,8 @@
+[profile.default]
+src = "contracts"
+out = "out"
+test = "contracts/test"
+libs = ["lib"]
+solc = "0.8.28"
+optimizer = true
+via_ir = true

@@ -1,1 +1,8 @@
 target
+out/
+cache/
+lib/
+logs/
+.env
+.arbitrage-*
+.superpowers/
