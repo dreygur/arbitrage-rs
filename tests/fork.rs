@@ -30,8 +30,6 @@ use common::*;
 
 /// Hookless V4 fee (pips) and tick spacing pairs the adapter probes.
 const PROBES: [(u32, i32); 4] = [(100, 1), (500, 10), (3000, 60), (10_000, 200)];
-/// Base fee set on the next block to push the fee per gas over `max_fee_per_gas`.
-const HIGH_BASE_FEE: u128 = 200_000_000_000;
 /// Tip of the dump that front runs a stale trade, well over the bot's.
 const FRONT_RUN_TIP: u128 = 50_000_000_000;
 /// Executor WETH the sweep test starts with, under the default `executor_max_hold`.
@@ -336,32 +334,31 @@ async fn idle_without_imbalance() {
   .await;
 }
 
-/// A base fee above `max_fee_per_gas` turns an open arbitrage into `GasCap` and nothing is
-/// sent.
+/// A fee per gas over the cap from `max_fee_per_gas` turns an open arbitrage into `GasCap`
+/// and nothing is sent.
+///
+/// anvil 1.9 on this fork ignores `anvil_setNextBlockBaseFeePerGas`, so the cap is lowered
+/// under the fee instead: `max_fee_per_gas` equal to the 1 gwei tip leaves a fee cap of
+/// 10/11 gwei, below base fee plus tip. The executor is deployed under the normal cap first
+/// and reused by the capped chain, since setup transactions obey the same cap.
 #[tokio::test]
 #[ignore = "needs a running fork: make fork"]
 async fn fee_cap_stops_trading() {
   forked(|| async {
-    let mut ctx = ctx(|_| {}).await;
-    let max_fee = EvmConfig::parse(&ctx.cfg).unwrap().max_fee_per_gas;
-    rpc(
-      &ctx.provider,
-      "anvil_setNextBlockBaseFeePerGas",
-      (U256::from(HIGH_BASE_FEE),),
-    )
+    drop(ctx(|_| {}).await);
+    let mut ctx = ctx(|cfg| {
+      let tip = cfg.adapter["priority_fee"].clone();
+      cfg.adapter.insert("max_fee_per_gas".into(), tip);
+    })
     .await;
-    let mut raised = false;
-    for _ in 0..BLOCKS {
-      next_block(&ctx).await;
-      if ctx.chain.status().next_base_fee > max_fee {
-        raised = true;
-        break;
-      }
-    }
-    assert!(raised, "base fee never rose over the cap");
+    let tip = EvmConfig::parse(&ctx.cfg).unwrap().priority_fee;
     let pair = sushi_pair(&ctx.provider, USDC).await;
     let update = imbalance(&ctx, &[pair]).await;
-    assert!(ctx.chain.status().next_base_fee > max_fee);
+    let status = ctx.chain.status();
+    assert!(
+      status.next_base_fee + tip > status.fee_cap,
+      "fee per gas within the cap: {status:?}"
+    );
     let results = step(&ctx, &update).await;
     assert!(!results.is_empty(), "the dumped pair was not evaluated");
     assert!(
