@@ -24,6 +24,8 @@ const SHORT_KEEP: usize = 6;
 const BPS: u64 = 10_000;
 /// Width of the verdict column: `locked #` and an eight digit block.
 pub const VERDICT_WIDTH: u16 = 16;
+/// Width of the block column: a nine digit block number.
+const BLOCK_WIDTH: u16 = 9;
 /// The key help shown on the last row.
 const KEYS: &str =
   "tab page  up/down select  enter detail  p pause/resume  s sweep  r reload  f filter  q quit";
@@ -177,7 +179,7 @@ fn holdings(app: &App) -> String {
   )
 }
 
-/// Pair, venues, size, profit, gas, net and verdict of one decision.
+/// Block, pair, venues, size, profit, gas, net and verdict of one decision.
 fn decision_row(decision: &Decision) -> Row<'static> {
   let money = |amount| format_amount(amount, BASE_DECIMALS);
   let (pair, size, profit, net) = match &decision.op {
@@ -190,6 +192,7 @@ fn decision_row(decision: &Decision) -> Row<'static> {
     None => ("-".into(), "-".into(), "-".into(), "-".into()),
   };
   Row::new(vec![
+    decision.block.to_string(),
     pair,
     decision.buy.describe(),
     decision.sell.describe(),
@@ -201,12 +204,12 @@ fn decision_row(decision: &Decision) -> Row<'static> {
   ])
 }
 
-/// The latest step's decisions under the filter, with the selected row highlighted.
+/// The recent decisions under the filter, newest first, with the selected row highlighted.
 fn opportunities(frame: &mut Frame, app: &App, area: Rect) {
   let visible = app.visible();
-  let block = visible.first().map_or(0, |decision| decision.block);
-  let rows: Vec<Row> = visible.iter().map(|d| decision_row(d)).collect();
+  let rows: Vec<Row> = visible.iter().map(|(_, d)| decision_row(d)).collect();
   let widths = [
+    Constraint::Length(BLOCK_WIDTH),
     Constraint::Length(16),
     Constraint::Fill(1),
     Constraint::Fill(1),
@@ -217,17 +220,13 @@ fn opportunities(frame: &mut Frame, app: &App, area: Rect) {
     Constraint::Length(VERDICT_WIDTH),
   ];
   let header = Row::new(vec![
-    "pair", "buy", "sell", "size", "profit", "gas", "net", "verdict",
+    "block", "pair", "buy", "sell", "size", "profit", "gas", "net", "verdict",
   ]);
   let table = Table::new(rows, widths)
     .header(header.style(Style::new().add_modifier(Modifier::BOLD)))
     .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-    .block(Block::bordered().title(format!(
-      "Opportunities  block {block}  filter {:?}",
-      app.filter
-    )));
-  let selected = app.selected.min(visible.len().saturating_sub(1));
-  let mut state = TableState::default().with_selected(Some(selected));
+    .block(Block::bordered().title(format!("Opportunities  filter {:?}", app.filter)));
+  let mut state = TableState::default().with_selected(Some(app.selected_row()));
   frame.render_stateful_widget(table, area, &mut state);
 }
 

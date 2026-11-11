@@ -13,6 +13,9 @@ use crate::types::{
 /// Trade events kept for the trades panel and the detail view; older ones are only in the
 /// journal.
 pub const TRADE_EVENTS: usize = 500;
+/// Decisions kept for the opportunities panel across blocks, so a sent trade and the
+/// numbers behind it stay open to the detail view after the next block.
+pub const DECISIONS: usize = 500;
 /// Log lines kept for the log panel.
 pub const LOG_LINES: usize = 200;
 
@@ -123,8 +126,11 @@ pub struct App {
   pub config: String,
   /// Most base token the executor may hold, shown against its balance.
   pub executor_cap: Amount,
-  /// Decisions of the latest step.
-  pub decisions: Vec<Decision>,
+  /// The last [`DECISIONS`] decisions, newest first, each with its arrival number, which
+  /// the selection holds on to.
+  pub decisions: VecDeque<(u64, Decision)>,
+  /// Arrival number of the next decision.
+  next_seq: u64,
   /// The latest decision of every pair seen, by buy and sell pool.
   pub pairs: BTreeMap<(Id, Id), Decision>,
   /// The last [`TRADE_EVENTS`] trade events, oldest first.
@@ -139,8 +145,9 @@ pub struct App {
   pub log: VecDeque<String>,
   /// Outcome of the last reload.
   pub reload: Option<ReloadEvent>,
-  /// Selected row among the filtered decisions.
-  pub selected: usize,
+  /// Arrival number of the selected decision, so the selection stays on it while newer
+  /// ones push it down; `None`, or a decision no longer listed, selects the top row.
+  pub selected: Option<u64>,
   /// Page shown.
   pub tab: Tab,
   /// Which decisions are listed.
@@ -160,7 +167,8 @@ impl App {
       network,
       config,
       executor_cap,
-      decisions: Vec::new(),
+      decisions: VecDeque::new(),
+      next_seq: 0,
       pairs: BTreeMap::new(),
       trades: VecDeque::new(),
       status: None,
@@ -168,7 +176,7 @@ impl App {
       totals: Totals::default(),
       log: VecDeque::new(),
       reload: None,
-      selected: 0,
+      selected: None,
       tab: Tab::Main,
       filter: Filter::All,
       detail: None,
@@ -177,27 +185,39 @@ impl App {
     }
   }
 
-  /// The decisions the opportunities panel lists under the current filter.
-  pub fn visible(&self) -> Vec<&Decision> {
+  /// The decisions the opportunities panel lists under the current filter, newest first,
+  /// each with its arrival number.
+  pub fn visible(&self) -> Vec<(u64, &Decision)> {
     self
       .decisions
       .iter()
-      .filter(|decision| self.filter.admits(decision.verdict))
+      .filter(|(_, decision)| self.filter.admits(decision.verdict))
+      .map(|(seq, decision)| (*seq, decision))
       .collect()
   }
 
-  /// Takes a decision; one from a newer block replaces the previous step's list.
+  /// The row of the selected decision among the listed ones; the top row when nothing is
+  /// selected or the selected decision is no longer listed.
+  pub fn selected_row(&self) -> usize {
+    let Some(selected) = self.selected else {
+      return 0;
+    };
+    self
+      .visible()
+      .iter()
+      .position(|(seq, _)| *seq == selected)
+      .unwrap_or(0)
+  }
+
+  /// Takes a decision at the top of the list, dropping the oldest past [`DECISIONS`].
   pub fn on_decision(&mut self, decision: Decision) {
-    if self
-      .decisions
-      .first()
-      .is_some_and(|first| first.block != decision.block)
-    {
-      self.decisions.clear();
-    }
     let key = (decision.buy.pool().clone(), decision.sell.pool().clone());
     self.pairs.insert(key, decision.clone());
-    self.decisions.push(decision);
+    if self.decisions.len() == DECISIONS {
+      self.decisions.pop_back();
+    }
+    self.decisions.push_front((self.next_seq, decision));
+    self.next_seq += 1;
   }
 
   /// Takes a trade event, dropping the oldest past [`TRADE_EVENTS`].
@@ -242,12 +262,15 @@ impl App {
 
   /// Moves the selection by one row, staying within the listed decisions.
   fn select(&mut self, down: bool) {
-    let last = self.visible().len().saturating_sub(1);
-    self.selected = if down {
-      (self.selected + 1).min(last)
+    let row = self.selected_row();
+    let visible = self.visible();
+    let last = visible.len().saturating_sub(1);
+    let row = if down {
+      (row + 1).min(last)
     } else {
-      self.selected.saturating_sub(1).min(last)
+      row.saturating_sub(1)
     };
+    self.selected = visible.get(row).map(|(seq, _)| *seq);
   }
 
   /// Opens the detail view on the selected decision, or closes it when open.
@@ -255,9 +278,11 @@ impl App {
     if self.detail.take().is_some() || self.tab != Tab::Main {
       return;
     }
-    let visible = self.visible();
-    let row = self.selected.min(visible.len().saturating_sub(1));
-    self.detail = visible.get(row).map(|decision| (*decision).clone());
+    let row = self.selected_row();
+    self.detail = self
+      .visible()
+      .get(row)
+      .map(|(_, decision)| (*decision).clone());
   }
 
   /// Records a command the runner accepted, so the run state shown is the one the bot has
@@ -285,7 +310,7 @@ impl App {
       KeyCode::Char('q') => Some(UiCommand::Quit),
       KeyCode::Char('f') => {
         self.filter = self.filter.next();
-        self.selected = 0;
+        self.selected = None;
         None
       }
       KeyCode::Tab => {

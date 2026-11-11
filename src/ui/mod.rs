@@ -404,6 +404,55 @@ mod tests {
     }
   }
 
+  /// A decision with `verdict` quoted at `block`.
+  fn decision_at(block: u64, verdict: Verdict) -> Decision {
+    Decision {
+      block,
+      ..decision(ETHER / 10, verdict)
+    }
+  }
+
+  /// Decisions of earlier blocks stay listed, newest first, so a sent trade can still be
+  /// opened after the next block; the list keeps at most [`app::DECISIONS`].
+  #[test]
+  fn decisions_kept_across_blocks() {
+    let mut app = app();
+    app.on_decision(decision_at(7, Verdict::Sent));
+    app.on_decision(decision_at(8, Verdict::BelowMin));
+    app.on_decision(decision_at(9, Verdict::BelowMin));
+    let blocks: Vec<u64> = app.visible().iter().map(|(_, d)| d.block).collect();
+    assert_eq!(blocks, vec![9, 8, 7]);
+    assert_eq!(app.on_key(KeyCode::Char('f')), None);
+    let sent: Vec<u64> = app.visible().iter().map(|(_, d)| d.block).collect();
+    assert_eq!(sent, vec![7]);
+    let text = screen(|frame| draw(frame, &app));
+    let row = text
+      .lines()
+      .find(|line| line.contains("mock a"))
+      .unwrap_or_else(|| panic!("no opportunity row:\n{text}"));
+    assert!(row.trim_start_matches('│').starts_with("7 "), "{row}");
+    for block in 10..10 + app::DECISIONS as u64 {
+      app.on_decision(decision_at(block, Verdict::BelowMin));
+    }
+    assert_eq!(app.decisions.len(), app::DECISIONS);
+  }
+
+  /// The selection stays on the decision the operator chose while newer ones arrive above
+  /// it, and enter opens that decision.
+  #[test]
+  fn selection_follows_decision() {
+    let mut app = app();
+    app.on_decision(decision_at(7, Verdict::Sent));
+    app.on_decision(decision_at(8, Verdict::BelowMin));
+    assert_eq!(app.on_key(KeyCode::Down), None);
+    assert_eq!(app.visible()[app.selected_row()].1.block, 7);
+    app.on_decision(decision_at(9, Verdict::BelowMin));
+    app.on_decision(decision_at(10, Verdict::BelowMin));
+    assert_eq!(app.visible()[app.selected_row()].1.block, 7);
+    assert_eq!(app.on_key(KeyCode::Enter), None);
+    assert_eq!(app.detail.as_ref().unwrap().block, 7);
+  }
+
   /// The command keys map to their commands and `p` alternates pause and resume.
   #[test]
   fn keys_map_to_commands() {
