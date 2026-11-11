@@ -11,6 +11,7 @@ use arbitrage::bot::Decision;
 use arbitrage::chain::evm::EvmChain;
 use arbitrage::config::{ChainKind, NetworkConfig};
 use arbitrage::error::{Error, Result};
+use arbitrage::redact::{self, Redacting};
 use arbitrage::supervisor::{Links, Supervisor};
 use arbitrage::types::{Status, TradeEvent, Verdict};
 use arbitrage::ui::app::App;
@@ -192,12 +193,14 @@ async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
   dotenvy::dotenv().ok();
+  redact::register_env();
   let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
   let headless = std::env::args().any(|arg| arg == HEADLESS);
   let logs = if headless {
     tracing_subscriber::fmt()
       .with_env_filter(filter)
       .with_span_events(FmtSpan::CLOSE)
+      .with_writer(|| Redacting(std::io::stderr()))
       .init();
     None
   } else {
@@ -206,13 +209,15 @@ async fn main() -> eyre::Result<()> {
       .with_env_filter(filter)
       .with_span_events(FmtSpan::CLOSE)
       .with_ansi(false)
-      .with_writer(move || writer.clone())
+      .with_writer(move || Redacting(writer.clone()))
       .init();
     Some(lines)
   };
   let network = std::env::var("NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.into());
   let _lock = take_lock(Path::new(&format!(".arbitrage-{network}.lock")))?;
-  run(&network, logs).await?;
+  run(&network, logs)
+    .await
+    .map_err(|e| eyre::eyre!(redact::redact(&e.to_string())))?;
   Ok(())
 }
 

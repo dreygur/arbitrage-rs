@@ -23,6 +23,7 @@ use crate::bot::{Bot, Decision, Exit};
 use crate::chain::Chain;
 use crate::config::{Change, NetworkConfig};
 use crate::error::{Error, Result};
+use crate::redact;
 use crate::types::{Control, ReloadEvent, Status};
 use crate::ui::UiCommand;
 
@@ -102,13 +103,17 @@ fn read_config(path: &Path, network: &str) -> Result<(NetworkConfig, String)> {
 }
 
 /// Loads `env_file` over the process env; a missing file is no error. A parse error is
-/// reported without its detail, since that quotes the line, which may hold a key.
+/// reported without its detail, since that quotes the line, which may hold a key. The
+/// node URLs are registered for redaction whatever the outcome, since a failed parse can
+/// still have set some of them.
 ///
 /// Only that exact path is read: `main` passes `.env`, relative to the working directory,
 /// unlike its startup load, which also searches parent directories. The config path is
 /// relative too, so the bot runs from the repository root.
 fn reread_env(env_file: &Path) -> Result<()> {
-  match dotenvy::from_path_override(env_file) {
+  let loaded = dotenvy::from_path_override(env_file);
+  redact::register_env();
+  match loaded {
     Ok(()) => Ok(()),
     Err(e) if e.not_found() => Ok(()),
     Err(_) => Err(Error::Env(format!(

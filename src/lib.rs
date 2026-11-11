@@ -6,6 +6,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod journal;
+pub mod redact;
 pub mod sizing;
 pub mod strategy;
 pub mod supervisor;

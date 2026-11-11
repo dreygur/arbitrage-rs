@@ -911,6 +911,7 @@ dependencies = [
  "tracing-subscriber",
  "uniswap-v3-sdk",
  "uniswap-v4-sdk",
+ "url",
 ]
 
 [[package]]

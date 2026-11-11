@@ -7,6 +7,7 @@ use arbitrage::chain::evm::fund::fund;
 use arbitrage::chain::evm::{env_var, parse_address};
 use arbitrage::config::NetworkConfig;
 use arbitrage::error::Error;
+use arbitrage::redact::{self, Redacting};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -15,11 +16,8 @@ const DEFAULT_NETWORK: &str = "ethereum";
 /// Log filter used when `RUST_LOG` is unset.
 const DEFAULT_LOG: &str = "info,alloy_transport_http=warn";
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-  dotenvy::dotenv().ok();
-  let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
-  tracing_subscriber::fmt().with_env_filter(filter).init();
+/// Funds every configured account of `NETWORK` and logs what each holds afterwards.
+async fn fund_accounts() -> eyre::Result<()> {
   let network = std::env::var("NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.into());
   let cfg = NetworkConfig::load(&network)?;
   let evm = EvmConfig::parse(&cfg)?;
@@ -40,4 +38,20 @@ async fn main() -> eyre::Result<()> {
     }
   }
   Ok(())
+}
+
+/// Sets up redacted logging and funds the accounts. A failure is redacted before eyre
+/// prints it, since a transport error quotes the node URL, which may hold a key.
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+  dotenvy::dotenv().ok();
+  redact::register_env();
+  let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
+  tracing_subscriber::fmt()
+    .with_env_filter(filter)
+    .with_writer(|| Redacting(std::io::stderr()))
+    .init();
+  fund_accounts()
+    .await
+    .map_err(|e| eyre::eyre!(redact::redact(&format!("{e:#}"))))
 }
