@@ -24,6 +24,10 @@ use crate::error::{Error, Result};
 
 /// Gas limit headroom over the node's estimate, as `6 / 5` (20%).
 const HEADROOM: (u64, u64) = (6, 5);
+/// JSON-RPC error code nodes use for a call that reverted.
+const REVERT_CODE: i64 = 3;
+/// Message of a call that reverted, sent by some nodes under another code.
+const REVERTED: &str = "execution reverted";
 
 /// The executor a previous run deployed, saved as JSON so the next run can find it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,16 +128,34 @@ pub fn executor_action(
   }
 }
 
+/// Whether a node error response with `code` and `message` says the call itself reverted:
+/// JSON-RPC code 3, or an "execution reverted" message, which some nodes send under
+/// another code.
+fn is_revert(code: i64, message: &str) -> bool {
+  code == REVERT_CODE || message.contains(REVERTED)
+}
+
 /// The address an immutable getter returned, or `None` when the contract does not answer
-/// it (a revert, no data, or data that does not decode), which marks a contract that is
-/// not ours. A node failure is an error, since it proves nothing about the contract.
+/// it (an execution revert, no data, or data that does not decode), which marks a
+/// contract that is not ours.
+///
+/// Every other failure is an error, never a mismatch: a rate limit, a pruned state or an
+/// internal node error proves nothing about the contract, and reading it as "not ours"
+/// would redeploy and forget an executor that may still hold profit.
 async fn immutable(
   call: impl IntoFuture<Output = std::result::Result<Address, alloy::contract::Error>>,
 ) -> Result<Option<Address>> {
   match call.await {
     Ok(address) => Ok(Some(address)),
-    Err(alloy::contract::Error::TransportError(e)) if e.as_error_resp().is_none() => Err(e.into()),
-    Err(_) => Ok(None),
+    Err(alloy::contract::Error::ZeroData(..) | alloy::contract::Error::AbiError(_)) => Ok(None),
+    Err(alloy::contract::Error::TransportError(e))
+      if e
+        .as_error_resp()
+        .is_some_and(|payload| is_revert(payload.code, &payload.message)) =>
+    {
+      Ok(None)
+    }
+    Err(e) => Err(e.into()),
   }
 }
 
@@ -521,6 +543,50 @@ mod tests {
     .unwrap();
     assert_eq!(action, ExecutorAction::Deploy);
     assert_eq!(asserter.read_q().len(), 3, "read past the owner");
+  }
+
+  /// Queues a node error response with `code` and `message` on `asserter`.
+  fn mock_error(asserter: &Asserter, code: i64, message: &str) {
+    let payload = serde_json::json!({ "code": code, "message": message });
+    asserter.push_failure(serde_json::from_value(payload).unwrap());
+  }
+
+  /// A contract whose `owner()` reverts is not ours, so a new executor is deployed.
+  #[tokio::test]
+  async fn deploy_when_owner_call_reverts() {
+    let asserter = Asserter::new();
+    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    mock_error(&asserter, REVERT_CODE, REVERTED);
+    let action = plan_executor(
+      &mock_provider(&asserter),
+      Some(&record()),
+      &mock_evm_config(),
+      weth(),
+      treasury(),
+      owner(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(action, ExecutorAction::Deploy);
+  }
+
+  /// A node error that is not a revert proves nothing about the contract: the decision
+  /// fails, so connect fails rather than deploying over an executor that may hold profit.
+  #[tokio::test]
+  async fn node_error_on_immutable_is_not_a_mismatch() {
+    let asserter = Asserter::new();
+    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    mock_error(&asserter, -32000, "header not found");
+    let planned = plan_executor(
+      &mock_provider(&asserter),
+      Some(&record()),
+      &mock_evm_config(),
+      weth(),
+      treasury(),
+      owner(),
+    )
+    .await;
+    assert!(matches!(planned, Err(Error::Contract(_))), "{planned:?}");
   }
 
   /// A contract whose immutables all match the config is reused.
