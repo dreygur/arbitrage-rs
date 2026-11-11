@@ -11,4 +11,5 @@ pub mod strategy;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod types;
+pub mod ui;
 pub mod venue;

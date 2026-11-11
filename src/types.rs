@@ -327,6 +327,16 @@ pub struct Status {
   pub accounts: Vec<AccountStatus>,
 }
 
+/// Outcome of a config reload, shown on the screen so a bad edit is seen without reading
+/// logs: the bot keeps its old settings when `error` is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadEvent {
+  /// One line per setting that changed.
+  pub changes: Vec<String>,
+  /// Why the new config was refused, when it was.
+  pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

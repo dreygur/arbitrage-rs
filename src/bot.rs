@@ -27,7 +27,9 @@ pub enum Exit {
   Done,
 }
 
-/// The record of one evaluated pair, for the dashboard.
+/// The record of one evaluated pair, for the dashboard. Cloned when the screen pins one for
+/// its detail view, so the view outlives the step that made it.
+#[derive(Clone)]
 pub struct Decision {
   /// Block the evaluation ran for.
   pub block: u64,

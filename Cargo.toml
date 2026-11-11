@@ -20,6 +20,7 @@ toml = "1"
 dotenvy = "0.15"
 eyre = "0.6"
 rayon = "1"
+ratatui = "0.30"
 
 [dev-dependencies]
 criterion = "0.8"

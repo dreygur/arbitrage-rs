@@ -1,15 +1,20 @@
-//! Bot entry point: takes the instance lock, connects the configured network and runs the bot.
+//! Bot entry point: takes the instance lock, connects the configured network and runs the bot,
+//! under the terminal screen unless `--headless` is given.
 
 use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arbitrage::bot::{Bot, Decision, Exit};
+use arbitrage::chain::Chain;
 use arbitrage::chain::evm::EvmChain;
 use arbitrage::config::{ChainKind, NetworkConfig};
 use arbitrage::error::{Error, Result};
-use arbitrage::types::{TradeEvent, Verdict};
-use tokio::sync::mpsc;
+use arbitrage::types::{Control, ReloadEvent, Status, TradeEvent, Verdict};
+use arbitrage::ui::app::App;
+use arbitrage::ui::{UiCommand, UiLog, run_ui};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -21,6 +26,16 @@ const DEFAULT_NETWORK: &str = "ethereum";
 const DEFAULT_LOG: &str = "info,alloy_transport_http=warn";
 /// Decisions buffered before the bot starts dropping them.
 const DECISIONS: usize = 1024;
+/// Log lines buffered for the screen before new ones are dropped.
+const LOG_BUFFER: usize = 1024;
+/// Reload outcomes buffered for the screen.
+const RELOADS: usize = 16;
+/// Screen commands buffered for the runner.
+const COMMANDS: usize = 16;
+/// How often the chain's status is copied for the screen.
+const STATUS_EVERY: Duration = Duration::from_millis(200);
+/// How often a quitting run checks whether its trades have settled.
+const DRAIN_POLL: Duration = Duration::from_millis(200);
 /// Flag that runs with logs only.
 const HEADLESS: &str = "--headless";
 
@@ -64,26 +79,123 @@ async fn log_trades(mut trades: mpsc::Receiver<TradeEvent>) {
   }
 }
 
-/// Connects to `network` and runs the bot once until it ends.
-async fn run(network: &str, headless: bool) -> Result<()> {
-  let cfg = NetworkConfig::load(network)?;
-  if !headless {
-    warn!("the terminal UI is not built yet, logging only");
-  }
-  let chain = match cfg.kind {
-    ChainKind::Evm => {
-      let (chain, trades) = EvmChain::connect(&cfg, network).await?;
-      tokio::spawn(log_trades(trades));
-      chain
-    }
-  };
-  let (decisions, decided) = mpsc::channel(DECISIONS);
-  tokio::spawn(log_decisions(decided));
-  let bot = Bot::new(Arc::new(chain), cfg.live.clone(), decisions);
-  match bot.run(None).await? {
+/// Logs how the bot's run ended.
+fn report_exit(exit: Exit) {
+  match exit {
     Exit::Restart => warn!("the chain asked for a restart, stopping"),
     Exit::Done => info!("done"),
   }
+}
+
+/// Copies the chain's status for the screen every [`STATUS_EVERY`] until the screen is gone.
+async fn publish_status<C: Chain>(chain: Arc<C>, status: watch::Sender<Status>) {
+  let mut tick = tokio::time::interval(STATUS_EVERY);
+  loop {
+    tick.tick().await;
+    if status.send(chain.status()).is_err() {
+      return;
+    }
+  }
+}
+
+/// Waits until no trade is in flight or `timeout` blocks have passed, so quitting never
+/// abandons a trade the engine could still settle.
+async fn drain<C: Chain>(chain: &C, timeout: u64) {
+  let start = chain.status().block;
+  while chain.in_flight() > 0 && chain.status().block.saturating_sub(start) < timeout {
+    tokio::time::sleep(DRAIN_POLL).await;
+  }
+}
+
+/// Carries out screen commands until `q`, or until the screen goes away, then pauses the bot
+/// and lets its trades settle.
+async fn serve<C: Chain>(
+  commands: &mut mpsc::Receiver<UiCommand>,
+  bot: &Bot<C>,
+  chain: &C,
+  timeout: u64,
+) {
+  loop {
+    match commands.recv().await {
+      Some(UiCommand::Pause) => bot.set_paused(true),
+      Some(UiCommand::Resume) => bot.set_paused(false),
+      Some(UiCommand::Sweep) => chain.control(Control::Sweep),
+      Some(UiCommand::Reload) => warn!("reload arrives with the supervisor"),
+      Some(UiCommand::Quit) | None => break,
+    }
+  }
+  info!(
+    in_flight = chain.in_flight(),
+    "stopping, waiting for trades in flight"
+  );
+  bot.set_paused(true);
+  drain(chain, timeout).await;
+}
+
+/// Runs the bot under the screen until `q` or the bot ends, then closes the screen.
+async fn run_with_screen(
+  network: &str,
+  cfg: &NetworkConfig,
+  chain: Arc<EvmChain>,
+  trades: mpsc::Receiver<TradeEvent>,
+  logs: mpsc::Receiver<String>,
+) -> Result<()> {
+  let config = std::fs::read_to_string(format!("config/{network}.toml"))?;
+  let app = App::new(
+    network.to_string(),
+    config,
+    cfg.live.limits.executor_max_hold,
+  );
+  let (decisions, decided) = mpsc::channel(DECISIONS);
+  let bot = Bot::new(chain.clone(), cfg.live.clone(), decisions);
+  let (status_tx, status_rx) = watch::channel(chain.status());
+  tokio::spawn(publish_status(chain.clone(), status_tx));
+  // Task 20's supervisor sends reload outcomes; the sender is held so the screen's
+  // receiver stays open until then.
+  let (_reloads, reload_rx) = mpsc::channel::<ReloadEvent>(RELOADS);
+  let (commands_tx, mut commands) = mpsc::channel(COMMANDS);
+  let screen = tokio::task::spawn_blocking(move || {
+    run_ui(
+      app,
+      decided,
+      trades,
+      status_rx,
+      reload_rx,
+      logs,
+      commands_tx,
+    )
+  });
+  let ended = tokio::select! {
+    exit = bot.run(None) => Some(exit),
+    () = serve(&mut commands, &bot, &chain, cfg.live.trade_timeout) => None,
+  };
+  drop(commands);
+  let shown = screen
+    .await
+    .map_err(|e| Error::Io(std::io::Error::other(e)));
+  match ended {
+    Some(exit) => report_exit(exit?),
+    None => info!("stopped"),
+  }
+  shown?
+}
+
+/// Connects to `network` and runs the bot once until it ends: with logs only when `logs`
+/// is absent, under the screen fed by `logs` otherwise.
+async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> {
+  let cfg = NetworkConfig::load(network)?;
+  let (chain, trades) = match cfg.kind {
+    ChainKind::Evm => EvmChain::connect(&cfg, network).await?,
+  };
+  let chain = Arc::new(chain);
+  if let Some(logs) = logs {
+    return run_with_screen(network, &cfg, chain, trades, logs).await;
+  }
+  tokio::spawn(log_trades(trades));
+  let (decisions, decided) = mpsc::channel(DECISIONS);
+  tokio::spawn(log_decisions(decided));
+  let bot = Bot::new(chain, cfg.live.clone(), decisions);
+  report_exit(bot.run(None).await?);
   Ok(())
 }
 
@@ -91,14 +203,26 @@ async fn run(network: &str, headless: bool) -> Result<()> {
 async fn main() -> eyre::Result<()> {
   dotenvy::dotenv().ok();
   let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
-  tracing_subscriber::fmt()
-    .with_env_filter(filter)
-    .with_span_events(FmtSpan::CLOSE)
-    .init();
   let headless = std::env::args().any(|arg| arg == HEADLESS);
+  let logs = if headless {
+    tracing_subscriber::fmt()
+      .with_env_filter(filter)
+      .with_span_events(FmtSpan::CLOSE)
+      .init();
+    None
+  } else {
+    let (writer, lines) = UiLog::channel(LOG_BUFFER);
+    tracing_subscriber::fmt()
+      .with_env_filter(filter)
+      .with_span_events(FmtSpan::CLOSE)
+      .with_ansi(false)
+      .with_writer(move || writer.clone())
+      .init();
+    Some(lines)
+  };
   let network = std::env::var("NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.into());
   let _lock = take_lock(Path::new(&format!(".arbitrage-{network}.lock")))?;
-  run(&network, headless).await?;
+  run(&network, logs).await?;
   Ok(())
 }
 
