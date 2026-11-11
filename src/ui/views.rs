@@ -24,6 +24,8 @@ const SHORT_KEEP: usize = 6;
 const BPS: u64 = 10_000;
 /// Width of the verdict column: `locked #` and an eight digit block.
 pub const VERDICT_WIDTH: u16 = 16;
+/// Words of a pool's `describe` text a table shows: the venue name and fee tier.
+const VENUE_WORDS: usize = 2;
 /// Width of the block column: a nine digit block number.
 const BLOCK_WIDTH: u16 = 9;
 /// The key help shown on the last row.
@@ -79,6 +81,17 @@ pub fn short(text: &str) -> String {
     &text[..SHORT_KEEP + 2],
     &text[text.len() - SHORT_KEEP..]
   )
+}
+
+/// The venue name and fee tier, the first two words of a pool's `describe` text. Table
+/// columns are too narrow for the price and reserve numbers that follow, which only show
+/// truncated; the detail view keeps the full text.
+pub fn venue_label(describe: &str) -> String {
+  describe
+    .split_whitespace()
+    .take(VENUE_WORDS)
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 /// The label a verdict is listed under.
@@ -195,8 +208,8 @@ fn decision_row(decision: &Decision) -> Row<'static> {
   Row::new(vec![
     decision.block.to_string(),
     pair,
-    decision.buy.describe(),
-    decision.sell.describe(),
+    venue_label(&decision.buy.describe()),
+    venue_label(&decision.sell.describe()),
     size,
     profit,
     money(decision.cost),
@@ -352,8 +365,8 @@ fn pairs_tab(frame: &mut Frame, app: &App, area: Rect) {
         bps.checked_div(op.amount)
       });
       Row::new(vec![
-        decision.buy.describe(),
-        decision.sell.describe(),
+        venue_label(&decision.buy.describe()),
+        venue_label(&decision.sell.describe()),
         or_dash(spread),
         decision.block.to_string(),
         verdict_label(decision.verdict),

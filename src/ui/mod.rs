@@ -168,7 +168,7 @@ mod tests {
 
   use super::app::App;
   use super::detail::draw_detail;
-  use super::views::{VERDICT_WIDTH, draw, format_amount};
+  use super::views::{VERDICT_WIDTH, draw, format_amount, venue_label};
   use super::*;
   use crate::bot::Decision;
   use crate::testkit::MockVenue;
@@ -518,6 +518,18 @@ mod tests {
     assert_eq!(app.config, "kind = \"evm\"\nmin_profit = \"1\"");
     assert_eq!(app.executor_cap, Amount::from(2 * ETHER));
     assert_eq!(app.log.back().unwrap(), "reload: min_profit");
+  }
+
+  /// Table cells keep only the venue name and fee tier of a pool's description; the raw
+  /// price and reserve numbers are left to the detail view.
+  #[test]
+  fn venue_label_keeps_name_and_fee() {
+    assert_eq!(
+      venue_label("uniswap_v4 5bps pf=0x1 p=79228162514264337593543950336 L=10 t=0"),
+      "uniswap_v4 5bps"
+    );
+    assert_eq!(venue_label("sushiswap 30bps r0=5 r1=7"), "sushiswap 30bps");
+    assert_eq!(venue_label("mock a"), "mock a");
   }
 
   /// Wei print in token units with four places.
