@@ -6,31 +6,27 @@ A flash-loan arbitrage bot for Uniswap V4, Uniswap V2 and SushiSwap. It watches 
 
 ## Screenshots
 
-Captured from a live fork run.
+Captured from a live fork run, with 16 swaps pushed through SushiSwap and Uniswap V2 on the USDC, USDT, DAI and WBTC pairs.
 
 ![Main screen](docs/images/main.png)
 
-The main screen after two executed trades, +0.5310 and +0.9195 ETH. The executor swept 1.3506 ETH to the treasury. The opportunities panel keeps recent decisions across blocks.
+The main screen: 15 trades executed and 1 reverted, for 3.3128 ETH net. Two sweeps moved 2.3864 ETH to the treasury. Each opportunity shows its verdict: sent, skipped for gas or for the minimum profit, or locked behind a trade in flight. Log times are in the local zone.
+
+![Decision detail](docs/images/detail.png)
+
+A sent decision: the legs, the profit by size curve, the send parameters, and the result. It was decided 16ms after the block was read and sent at 17.6ms, and it earned 0.0643 ETH.
+
+![Pairs tab](docs/images/pairs.png)
+
+The Pairs tab: each venue pair with its last spread and verdict.
+
+![Config tab](docs/images/config.png)
+
+The Config tab shows the running config, with every key commented.
 
 ![Connecting](docs/images/connecting.png)
 
 Startup: the screen shows the connect while pools load, before any trading.
-
-![First trade](docs/images/first-trade.png)
-
-The first trade, Executed.
-
-![Decision detail](docs/images/detail.png)
-
-A SENT decision: the legs, the profit by size curve, the send parameters, and timing. Decided in 76ms, sent in 79ms.
-
-![Pairs tab](docs/images/pairs.png)
-
-The Pairs tab.
-
-![Config tab](docs/images/config.png)
-
-The Config tab.
 
 ## Credentials
 
@@ -76,7 +72,7 @@ Make targets:
 
 After `make teardown`, run `make setup` again before any fork target.
 
-The first `make run` connects slowly, a few minutes, while pool state loads.
+The first `make run` on a newly pinned block connects slowly, about ten minutes, because anvil fetches pool state from `FORK_URL` one storage slot at a time, about ten thousand requests. That costs credits on a paid key. Later runs on the same block read anvil's disk cache and connect in seconds. A free node such as publicnode keeps old state for only a few minutes, so an old pin needs a node that serves historical state, or `make fork-fresh`.
 
 ### Fork tests
 
