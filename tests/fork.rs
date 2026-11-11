@@ -8,7 +8,7 @@
 mod common;
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
@@ -560,7 +560,7 @@ async fn journal_records_executed_trade() {
         break;
       }
       assert!(Instant::now() < deadline, "executed line never journaled");
-      tokio::time::sleep(Duration::from_millis(100)).await;
+      tokio::time::sleep(POLL).await;
     }
   })
   .await;

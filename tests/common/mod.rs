@@ -229,6 +229,81 @@ pub struct Ctx {
   pub decisions: mpsc::Receiver<Decision>,
 }
 
+/// Waits until the engine has taken the head of `block`, so its fee and locks are current
+/// when the bot steps.
+async fn engine_took(ctx: &Ctx, block: u64) {
+  let deadline = Instant::now() + WAIT;
+  while ctx.chain.status().block < block {
+    assert!(Instant::now() < deadline, "engine never took block {block}");
+    tokio::time::sleep(POLL).await;
+  }
+}
+
+/// Folds `update` into `merged`: its touched pools, its block, and any reload or restart.
+fn merge(merged: &mut Update, update: Update) {
+  merged.touched.extend(update.touched);
+  merged.reload |= update.reload;
+  merged.restart |= update.restart;
+  merged.block = update.block;
+}
+
+/// Takes the next change the chain has queued and waits until the engine has taken its
+/// head. The change must already be mined; the timeout is a safety net.
+pub async fn next_change(ctx: &Ctx) -> Update {
+  let update = tokio::time::timeout(WAIT, ctx.chain.changes())
+    .await
+    .expect("no block from the fork")
+    .expect("changes");
+  engine_took(ctx, update.block).await;
+  update
+}
+
+/// Pulls changes until the chain has applied the already mined `block`, at least one, and
+/// returns them merged: every touched pool, the last block, and whether any asked for a
+/// reload or restart.
+pub async fn catch_up(ctx: &Ctx, block: u64) -> Update {
+  let mut merged = Update::default();
+  loop {
+    merge(&mut merged, next_change(ctx).await);
+    if merged.block >= block {
+      return merged;
+    }
+  }
+}
+
+/// Mines empty blocks with `evm_mine`, one every [`FEED_WAIT`], until the chain delivers a
+/// change, then catches up to the last block mined. The engine also runs the maintenance
+/// held back for the block before.
+///
+/// The feed subscribes to heads in its own task, so right after a connect a mined block can
+/// come before the subscription and never be delivered; the next one then arrives. Only the
+/// re-mining is on a timer: `changes` runs to completion, never dropped halfway through
+/// applying a block, and [`WAIT`] cancels it only when no block ever arrives.
+pub async fn advance(ctx: &Ctx) -> Update {
+  rpc(&ctx.provider, "evm_mine", ()).await;
+  let remine = async {
+    loop {
+      tokio::time::sleep(FEED_WAIT).await;
+      rpc(&ctx.provider, "evm_mine", ()).await;
+    }
+  };
+  let first = tokio::select! {
+    first = tokio::time::timeout(WAIT, ctx.chain.changes()) => {
+      first.expect("the feed delivered no block").expect("changes")
+    }
+    () = remine => unreachable!("re-mining never ends"),
+  };
+  engine_took(ctx, first.block).await;
+  let mined = ctx.provider.get_block_number().await.expect("block number");
+  let block = first.block;
+  let mut merged = Update::default();
+  merge(&mut merged, first);
+  if block < mined {
+    merge(&mut merged, catch_up(ctx, mined).await);
+  }
+  merged
+}
+
 /// Loads the shipped config with a fresh journal under `target/test-journals/`, applies
 /// `overrides`, funds the accounts and the dumper (dropping their EIP 7702 delegations),
 /// connects the chain and a bot over it, and mines until the feed delivers a block, so the
@@ -422,74 +497,6 @@ pub async fn dump(provider: &DynProvider, pair: Address, weth_amount: U256) -> (
     block = block.max(receipt.block_number.expect("mined block"));
   }
   (block, out)
-}
-
-/// Waits until the engine has taken the head of `block`, so its fee and locks are current
-/// when the bot steps.
-async fn engine_took(ctx: &Ctx, block: u64) {
-  let deadline = Instant::now() + WAIT;
-  while ctx.chain.status().block < block {
-    assert!(Instant::now() < deadline, "engine never took block {block}");
-    tokio::time::sleep(POLL).await;
-  }
-}
-
-/// Folds `update` into `merged`: its touched pools, its block, and any reload or restart.
-fn merge(merged: &mut Update, update: Update) {
-  merged.touched.extend(update.touched);
-  merged.reload |= update.reload;
-  merged.restart |= update.restart;
-  merged.block = update.block;
-}
-
-/// Takes the next change the chain has queued and waits until the engine has taken its
-/// head. The change must already be mined; the timeout is a safety net.
-pub async fn next_change(ctx: &Ctx) -> Update {
-  let update = tokio::time::timeout(WAIT, ctx.chain.changes())
-    .await
-    .expect("no block from the fork")
-    .expect("changes");
-  engine_took(ctx, update.block).await;
-  update
-}
-
-/// Pulls changes until the chain has applied the already mined `block`, at least one, and
-/// returns them merged: every touched pool, the last block, and whether any asked for a
-/// reload or restart.
-pub async fn catch_up(ctx: &Ctx, block: u64) -> Update {
-  let mut merged = Update::default();
-  loop {
-    merge(&mut merged, next_change(ctx).await);
-    if merged.block >= block {
-      return merged;
-    }
-  }
-}
-
-/// Mines an empty block with `evm_mine` and catches up to it, which also lets the engine run
-/// the maintenance held back for the block before.
-///
-/// The feed subscribes to heads in its own task, so right after a connect a mined block can
-/// come before the subscription and never be delivered. Each block gets [`FEED_WAIT`] to show
-/// up, and another is mined when it does not, until one arrives or [`WAIT`] runs out.
-pub async fn advance(ctx: &Ctx) -> Update {
-  let deadline = Instant::now() + WAIT;
-  loop {
-    rpc(&ctx.provider, "evm_mine", ()).await;
-    let mined = ctx.provider.get_block_number().await.expect("block number");
-    if let Ok(first) = tokio::time::timeout(FEED_WAIT, ctx.chain.changes()).await {
-      let first = first.expect("changes");
-      engine_took(ctx, first.block).await;
-      let mut merged = Update::default();
-      let block = first.block;
-      merge(&mut merged, first);
-      if block < mined {
-        merge(&mut merged, catch_up(ctx, mined).await);
-      }
-      return merged;
-    }
-    assert!(Instant::now() < deadline, "the feed delivered no block");
-  }
 }
 
 /// Dumps a tenth of their WETH into each of `pairs` and catches up past the dumps.
