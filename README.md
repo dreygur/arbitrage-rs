@@ -40,6 +40,16 @@ Copy the env file first. It ships the anvil test mnemonic as `MNEMONIC_1`.
 cp .env.example .env
 ```
 
+Run it on a fork, each in its own terminal:
+
+```
+make fork
+make fund
+make run
+```
+
+To see a trade, push one pool off price, for example a large swap on SushiSwap's WETH/USDC pair from another anvil account.
+
 Make targets:
 
 - `make setup` installs Foundry and forge-std.
@@ -82,6 +92,6 @@ Copy `config/ethereum.toml` and edit it. Run with `NETWORK=<name>`.
 
 ### Adding a DEX family
 
-1. Add a venue in `chain/evm/venue`.
+1. Add a venue in `src/chain/evm/venue`.
 2. Add a library in `contracts/legs`.
 3. Add a `Family` variant.
