@@ -234,7 +234,15 @@ fn opportunities(frame: &mut Frame, app: &App, area: Rect) {
     Constraint::Length(VERDICT_WIDTH),
   ];
   let header = Row::new(vec![
-    "block", "pair", "buy", "sell", "size ETH", "profit ETH", "gas ETH", "net ETH", "verdict",
+    "block",
+    "pair",
+    "buy",
+    "sell",
+    "size ETH",
+    "profit ETH",
+    "gas ETH",
+    "net ETH",
+    "verdict",
   ]);
   let table = Table::new(rows, widths)
     .header(header.style(Style::new().add_modifier(Modifier::BOLD)))

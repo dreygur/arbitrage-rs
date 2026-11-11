@@ -124,7 +124,10 @@ mod tests {
     assert_eq!("local".parse::<TimeZone>().unwrap(), TimeZone::Local);
     assert_eq!("utc".parse::<TimeZone>().unwrap(), TimeZone::Utc);
     let plus: TimeZone = "+06:00".parse().unwrap();
-    assert_eq!(plus, TimeZone::Fixed(FixedOffset::east_opt(6 * HOUR).unwrap()));
+    assert_eq!(
+      plus,
+      TimeZone::Fixed(FixedOffset::east_opt(6 * HOUR).unwrap())
+    );
     let minus: TimeZone = "-03:30".parse().unwrap();
     assert_eq!(
       minus,

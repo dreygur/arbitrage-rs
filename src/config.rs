@@ -435,11 +435,12 @@ mod tests {
   /// A bad time zone is rejected naming the key and value; absent means local.
   #[test]
   fn time_zone_key() {
-    let err = edited("owner = 0", "owner = 0\ntime_zone = \"mars\"").unwrap_err();
+    let err = edited("time_zone = \"local\"", "time_zone = \"mars\"").unwrap_err();
     assert_eq!(err.to_string(), "config: time_zone: \"mars\"");
-    let utc = edited("owner = 0", "owner = 0\ntime_zone = \"utc\"").unwrap();
+    let utc = edited("time_zone = \"local\"", "time_zone = \"utc\"").unwrap();
     assert_eq!(utc.time_zone, TimeZone::Utc);
     let old = NetworkConfig::parse(ETHEREUM, "ethereum").unwrap();
+    assert_eq!(old.time_zone, TimeZone::Local);
     assert_eq!(old.diff(1, &utc, 1), Change::Restart);
   }
 

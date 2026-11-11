@@ -243,7 +243,8 @@ async fn main() -> eyre::Result<()> {
       .with_writer(move || Redacting(writer.clone()))
       .init();
     Some(lines)
-  };  let _lock = take_lock(Path::new(&format!(".arbitrage-{network}.lock")))?;
+  };
+  let _lock = take_lock(Path::new(&format!(".arbitrage-{network}.lock")))?;
   run(&network, logs)
     .await
     .map_err(|e| eyre::eyre!(redact::redact(&e.to_string())))?;

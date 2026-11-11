@@ -1,89 +1,160 @@
-kind = "evm"
-base_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-min_profit = "1000000000000000"
-max_trade = "100000000000000000000"
-max_gas_cost = "20000000000000000"
-trade_timeout = 3
-max_reverts = 3
-revert_window = 20
-cooldown_blocks = 50
-max_revert_gas = "50000000000000000"
-owner = 0
-treasury = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+# Each key says what it does, its unit, the ETH or gwei value for wei strings, and whether
+# a reload applies it live or needs a restart.
 
+# Kind of chain; only "evm" exists. Restart.
+kind = "evm"
+# Token borrowed and profited in, here WETH. Restart.
+base_token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+# Smallest profit worth trading, in wei of the base token: 0.001 ETH. Live.
+min_profit = "1000000000000000"
+# Largest base token amount to borrow, in wei: 100 ETH. Live.
+max_trade = "100000000000000000000"
+# Most gas one trade may cost, in wei: 0.02 ETH. Live.
+max_gas_cost = "20000000000000000"
+# Blocks after which an unmined trade is dropped. Live.
+trade_timeout = 3
+# Reverts within revert_window blocks that open the circuit breaker. Restart.
+max_reverts = 3
+# Length of the revert window, in blocks. Restart.
+revert_window = 20
+# Blocks the breaker stays open once tripped. Restart.
+cooldown_blocks = 50
+# Gas spent on reverts within the window that opens the breaker, in wei: 0.05 ETH. Restart.
+max_revert_gas = "50000000000000000"
+# Index of the owner in the flattened account list; the owner sweeps and funds. Restart.
+owner = 0
+# Address that receives swept profit. Restart.
+treasury = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+# Zone of log timestamps: "local" (OS zone, also the default when absent), "utc" or a
+# fixed offset such as "+06:00" or "-03:30". Restart, since logging is set up once.
+time_zone = "local"
+
+# Holding limits for the executor contract and the operator accounts. Live.
 [limits]
+# Executor balance above which profit is swept, in wei: 1 ETH.
 executor_max_hold = "1000000000000000000"
+# Executor balance left behind after a sweep, in wei: 0.1 ETH.
 executor_keep = "100000000000000000"
+# Account balance above which the excess is moved out, in wei: 2 ETH.
 account_max_hold = "2000000000000000000"
+# Account balance left behind after moving the excess, in wei: 0.5 ETH.
 account_keep = "500000000000000000"
+# Account balance below which it is flagged low on gas, in wei: 0.1 ETH.
 account_min_gas = "100000000000000000"
+# Smallest transfer worth sending, in wei: 0.05 ETH.
 min_transfer = "50000000000000000"
 
+# Signing accounts. Restart.
 [[accounts]]
+# Where the keys come from: "mnemonic" or "key".
 source = "mnemonic"
+# Env var holding the mnemonic; the value never goes in this file.
 env = "MNEMONIC_1"
+# Derivation indices, one account each.
 indices = [0, 1, 2]
 
+# Which pairs to watch. Restart.
 [pairs]
+# "list" watches the tokens below, "discover" scans the venues for pairs.
 mode = "list"
+# Tokens paired with the base token in list mode: USDC, USDT, DAI and WBTC.
 tokens = [
   "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
   "0xdAC17F958D2ee523a2206206994597C13D831ec7",
   "0x6B175474E89094C44Da98b954EedeAC495271d0F",
   "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
 ]
+# Most pairs to examine in discover mode.
 max_scan = 5000
+# Smallest base token reserve a discovered pool needs, in wei: 10 ETH.
 min_base_reserve = "10000000000000000000"
 
+# Ethereum adapter settings. Restart.
 [adapter]
+# EIP-155 chain id; 1 is mainnet.
 chain_id = 1
+# Uniswap v4 PoolManager address.
 pool_manager = "0x000000000004444c5dc75cB358380D2e3dE08A90"
+# Uniswap v4 StateView address, used to read pool state.
 state_view = "0x7fFE42C4a5DEeA5b0feC41C94C136Cf115597227"
+# Multicall3 address, used to batch reads.
 multicall = "0xcA11bde05977b3631167028862bE2a173976CA11"
+# Priority fee per gas, in wei: 1 gwei.
 priority_fee = "1000000000"
+# Ceiling on the fee cap per gas, in wei: 50 gwei.
 max_fee_per_gas = "50000000000"
+# Gas limit for a trade between two v2 venues.
 gas_v2_v2 = 350000
+# Gas limit for a trade between a v2 and a v4 venue.
 gas_v2_v4 = 360000
+# Gas limit for a trade between two v4 venues.
 gas_v4_v4 = 350000
+# Highest gas limit a trade may be sent with.
 max_gas_limit = 1000000
 
 [[adapter.venues]]
+# Venue name shown on screen.
 name = "uniswap_v4"
+# Pool family: "v2" or "v4".
 family = "v4"
+# Contract address of the venue.
 address = "0x000000000004444c5dc75cB358380D2e3dE08A90"
+# Tick bitmap words read around the current tick; v4 only.
 tick_words = 4
 
 [[adapter.venues]]
+# Venue name shown on screen.
 name = "uniswap_v2"
+# Pool family: "v2" or "v4".
 family = "v2"
+# Contract address of the venue, here its factory.
 address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+# Swap fee in basis points; v2 only.
 fee_bps = 30
 
 [[adapter.venues]]
+# Venue name shown on screen.
 name = "sushiswap"
+# Pool family: "v2" or "v4".
 family = "v2"
+# Contract address of the venue, here its factory.
 address = "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
+# Swap fee in basis points; v2 only.
 fee_bps = 30
 
+# Local fork funding, used by make fund and never on a live node.
 [adapter.fork]
+# ETH given to each account, in wei: 1 ETH.
 fund_eth = "1000000000000000000"
 
 [[adapter.fork.tokens]]
+# USDC. Token to fund each account with.
 address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+# Amount in token units, 6 decimals: 100000 USDC.
 amount = "100000000000"
+# Holder the tokens are taken from.
 whale = "0x28C6c06298d514Db089934071355E5743bf21d60"
 
 [[adapter.fork.tokens]]
+# USDT. Token to fund each account with.
 address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+# Amount in token units, 6 decimals: 100000 USDT.
 amount = "100000000000"
+# Holder the tokens are taken from.
 whale = "0x28C6c06298d514Db089934071355E5743bf21d60"
 
 [[adapter.fork.tokens]]
+# DAI. Token to fund each account with.
 address = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+# Amount in token units, 18 decimals: 100000 DAI.
 amount = "100000000000000000000000"
+# Holder the tokens are taken from.
 whale = "0x28C6c06298d514Db089934071355E5743bf21d60"
 
 [[adapter.fork.tokens]]
+# WBTC. Token to fund each account with.
 address = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+# Amount in token units, 8 decimals: 1 WBTC.
 amount = "100000000"
+# Holder the tokens are taken from.
 whale = "0x28C6c06298d514Db089934071355E5743bf21d60"
