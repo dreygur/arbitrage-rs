@@ -12,6 +12,7 @@ use arbitrage::chain::evm::gas::gas_cost;
 use arbitrage::chain::evm::{env_var, parse_address};
 use arbitrage::config::NetworkConfig;
 use arbitrage::error::Error;
+use arbitrage::logtime::{self, Stamp};
 use arbitrage::redact::{self, Redacting};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -85,8 +86,10 @@ async fn main() -> eyre::Result<()> {
   dotenvy::dotenv().ok();
   redact::register_env();
   let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
+  let network = std::env::var("NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.into());
   tracing_subscriber::fmt()
     .with_env_filter(filter)
+    .with_timer(Stamp(logtime::zone_of(&network)))
     .with_writer(|| Redacting(std::io::stderr()))
     .init();
   sweep()

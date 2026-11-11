@@ -895,6 +895,7 @@ name = "arbitrage"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "chrono",
  "criterion",
  "dotenvy",
  "eyre",

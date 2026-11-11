@@ -11,6 +11,7 @@ use arbitrage::bot::Decision;
 use arbitrage::chain::evm::EvmChain;
 use arbitrage::config::{ChainKind, NetworkConfig};
 use arbitrage::error::{Error, Result};
+use arbitrage::logtime::{self, Stamp};
 use arbitrage::redact::{self, Redacting};
 use arbitrage::supervisor::{Links, Supervisor};
 use arbitrage::types::{Phase, Status, TradeEvent, Verdict};
@@ -222,10 +223,13 @@ async fn main() -> eyre::Result<()> {
   redact::register_env();
   let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG));
   let headless = std::env::args().any(|arg| arg == HEADLESS);
+  let network = std::env::var("NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.into());
+  let stamp = Stamp(logtime::zone_of(&network));
   let logs = if headless {
     tracing_subscriber::fmt()
       .with_env_filter(filter)
       .with_span_events(FmtSpan::CLOSE)
+      .with_timer(stamp)
       .with_writer(|| Redacting(std::io::stderr()))
       .init();
     None
@@ -234,13 +238,12 @@ async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
       .with_env_filter(filter)
       .with_span_events(FmtSpan::CLOSE)
+      .with_timer(stamp)
       .with_ansi(false)
       .with_writer(move || Redacting(writer.clone()))
       .init();
     Some(lines)
-  };
-  let network = std::env::var("NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.into());
-  let _lock = take_lock(Path::new(&format!(".arbitrage-{network}.lock")))?;
+  };  let _lock = take_lock(Path::new(&format!(".arbitrage-{network}.lock")))?;
   run(&network, logs)
     .await
     .map_err(|e| eyre::eyre!(redact::redact(&e.to_string())))?;
