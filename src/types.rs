@@ -147,7 +147,7 @@ pub enum Verdict {
   GasCap,
   /// Quoting failed.
   QuoteError,
-  /// The pair is locked by an in flight trade until the given block.
+  /// The pair is locked by the in flight trade with the given id until it settles.
   Locked(u64),
   /// The sending account is low on gas funds.
   LowGas,

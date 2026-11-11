@@ -213,6 +213,9 @@ async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> 
   supervised.and(shown)
 }
 
+/// Loads `.env`, registers the node URLs for redaction, routes logs to the screen or, with
+/// `--headless`, to stderr, takes the instance lock and runs the bot. A failure is redacted
+/// before eyre prints it.
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
   dotenvy::dotenv().ok();

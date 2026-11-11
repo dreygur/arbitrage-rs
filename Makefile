@@ -37,13 +37,13 @@ abi:
 	cp out/FlashArbitrage.sol/FlashArbitrage.json abi/
 
 test-contracts:
-	$(FORGE) test --fork-url $(FORK_URL)
+	@$(FORGE) test --fork-url $(FORK_URL)
 
 fork:
-	$(ANVIL) --fork-url $(FORK_URL) --block-time 2
+	@$(ANVIL) --fork-url $(FORK_URL) --block-time 2
 
 refork:
-	curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"anvil_reset","params":[{"forking":{"jsonRpcUrl":"$(FORK_URL)"}}]}' $(RPC_URL)
+	@curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"anvil_reset","params":[{"forking":{"jsonRpcUrl":"$(FORK_URL)"}}]}' $(RPC_URL)
 
 fund:
 	cargo run --release --bin fund

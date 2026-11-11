@@ -22,7 +22,7 @@ const PLACES: u8 = 4;
 const SHORT_KEEP: usize = 6;
 /// Basis points in one whole, for the spread on the pairs tab.
 const BPS: u64 = 10_000;
-/// Width of the verdict column: `locked #` and an eight digit block.
+/// Width of the verdict column: `locked #` and an eight digit trade id.
 pub const VERDICT_WIDTH: u16 = 16;
 /// Words of a pool's `describe` text a table shows: the venue name and fee tier.
 const VENUE_WORDS: usize = 2;
@@ -102,7 +102,7 @@ pub fn verdict_label(verdict: Verdict) -> String {
     Verdict::GasExceedsProfit => "skip: gas".into(),
     Verdict::GasCap => "skip: gas cap".into(),
     Verdict::QuoteError => "skip: quote".into(),
-    Verdict::Locked(block) => format!("locked #{block}"),
+    Verdict::Locked(trade) => format!("locked #{trade}"),
     Verdict::LowGas => "skip: low gas".into(),
     Verdict::CircuitOpen => "breaker".into(),
     Verdict::Paused => "paused".into(),

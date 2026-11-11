@@ -183,7 +183,10 @@ impl V4Pool {
   /// keys the SDK cannot price (unsorted currencies, a non positive tick spacing or a fee
   /// that is not a static LP fee) and for pools where neither currency is native or
   /// `base_alias`.
-  #[allow(clippy::too_many_arguments)]
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate piece of pool state read from the chain"
+  )]
   pub fn new(
     venue: String,
     pool: Id,

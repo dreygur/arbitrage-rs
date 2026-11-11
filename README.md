@@ -57,6 +57,7 @@ Make targets:
 - `make test-contracts` runs the forge tests against `FORK_URL`.
 - `make fork` starts anvil as a mainnet fork, one block every 2 seconds.
 - `make refork` resets the running anvil to the current mainnet head.
+- Neither echoes `FORK_URL`, which usually holds a provider key, but anvil prints its fork URL in its startup banner, so keep that terminal's output private.
 - `make fund` funds the configured accounts with ETH and tokens on the fork.
 - `make sweep` sends the executor's base token profit to the treasury.
 - `make journal` prints the last 20 trade journal entries.
