@@ -8,23 +8,29 @@
 mod common;
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::{SolCall, SolError};
+use tokio::sync::{mpsc, watch};
 
 use arbitrage::chain::Chain;
+use arbitrage::chain::evm::EvmChain;
 use arbitrage::chain::evm::bindings::{
   FlashArbitrage, IERC20, IStateView, IUniswapV2Router02, IV4Quoter, QuoteExactSingleParams,
 };
 use arbitrage::chain::evm::config::EvmConfig;
 use arbitrage::chain::evm::convert::to_id;
+use arbitrage::chain::evm::executor::read_record;
 use arbitrage::chain::evm::fund::fund;
 use arbitrage::chain::evm::venue::v4::{V4Key, virtual_base_reserve};
-use arbitrage::config::PairMode;
+use arbitrage::config::{NetworkConfig, PairMode};
 use arbitrage::journal::read_last;
-use arbitrage::types::{Amount, EntryKind, Id, TradeState, Verdict};
+use arbitrage::supervisor::{Links, Supervisor};
+use arbitrage::types::{Amount, EntryKind, Id, Status, TradeState, Verdict};
+use arbitrage::ui::UiCommand;
 use arbitrage::venue::Venue;
 
 use common::*;
@@ -44,6 +50,14 @@ const DISCOVERY_SCAN: u64 = 50;
 const V2_ID_LEN: usize = 20;
 /// Bytes in a V4 pool id.
 const V4_ID_LEN: usize = 32;
+/// The shipped config's mnemonic indices: the owner and two operators.
+const THREE_ACCOUNTS: &str = "indices = [0, 1, 2]";
+/// The same mnemonic with index 3 added as a third operator.
+const FOUR_ACCOUNTS: &str = "indices = [0, 1, 2, 3]";
+/// An env file that does not exist, so a reload keeps the env `setup` made.
+const NO_ENV_FILE: &str = "target/fork-test-no.env";
+/// Screen commands and reload outcomes buffered between the reload test and its supervisor.
+const LINKS: usize = 8;
 
 /// The snapshot venue of `pool`.
 fn venue(ctx: &Ctx, pool: &Id) -> std::sync::Arc<dyn Venue> {
@@ -562,6 +576,90 @@ async fn journal_records_executed_trade() {
       assert!(Instant::now() < deadline, "executed line never journaled");
       tokio::time::sleep(POLL).await;
     }
+  })
+  .await;
+}
+
+/// The shipped config with `indices` as its mnemonic line and a journal at `journal`.
+fn config_text(indices: &str, journal: &Path) -> String {
+  let shipped = std::fs::read_to_string(format!("config/{CONFIG}.toml")).expect("config");
+  assert!(
+    shipped.contains(THREE_ACCOUNTS),
+    "config lacks {THREE_ACCOUNTS}"
+  );
+  format!(
+    "journal = \"{}\"\n{}",
+    journal.display(),
+    shipped.replace(THREE_ACCOUNTS, indices)
+  )
+}
+
+/// A reload that adds mnemonic index 3 restarts the chain on the same executor, which
+/// grants the new account the operator role.
+#[tokio::test]
+#[ignore = "needs the test fork: make test-fork"]
+async fn reload_adds_operator() {
+  forked(|| async {
+    let journal = journal_path();
+    let path = journal.with_extension("toml");
+    std::fs::create_dir_all(path.parent().expect("config dir")).expect("config dir");
+    std::fs::write(&path, config_text(THREE_ACCOUNTS, &journal)).expect("write config");
+    let grown = NetworkConfig::parse(&config_text(FOUR_ACCOUNTS, &journal), NETWORK).unwrap();
+    let provider = provider().await;
+    let fork = EvmConfig::parse(&grown)
+      .unwrap()
+      .fork
+      .expect("adapter.fork");
+    let added = accounts(&grown)[3];
+    // The added account only needs gas: the test checks its role, not its trades.
+    fund(&provider, &fork, treasury(&grown), &accounts(&grown)[..3])
+      .await
+      .expect("fund");
+    rpc(&provider, "anvil_setBalance", (added, ETHER)).await;
+    let (decisions, _decided) = mpsc::channel(DECISIONS);
+    let (commands, command_rx) = mpsc::channel(LINKS);
+    let (reloads, mut reload_rx) = mpsc::channel(LINKS);
+    let (status, _status_rx) = watch::channel(Status::default());
+    let links = Links {
+      decisions,
+      commands: command_rx,
+      reloads,
+      status,
+    };
+    let build = |cfg: NetworkConfig| async move {
+      let (chain, _events) = EvmChain::connect(&cfg, NETWORK).await?;
+      Ok(chain)
+    };
+    let supervisor = Supervisor::new(
+      NETWORK.into(),
+      path.clone(),
+      PathBuf::from(NO_ENV_FILE),
+      build,
+      links,
+    )
+    .await
+    .expect("supervisor");
+    let record = PathBuf::from(format!(".arbitrage-{NETWORK}.json"));
+    let executor = read_record(&record).unwrap().expect("record").address;
+    let contract = FlashArbitrage::new(executor, &provider);
+    assert!(!contract.operators(added).call().await.unwrap());
+    let driver = async {
+      std::fs::write(&path, config_text(FOUR_ACCOUNTS, &journal)).expect("write config");
+      commands.send(UiCommand::Reload).await.unwrap();
+      let event = tokio::time::timeout(WAIT, reload_rx.recv())
+        .await
+        .expect("no reload outcome")
+        .expect("reload channel");
+      assert_eq!(event.changes, vec!["accounts"], "{event:?}");
+      assert_eq!(
+        read_record(&record).unwrap().expect("record").address,
+        executor
+      );
+      assert!(contract.operators(added).call().await.unwrap());
+      commands.send(UiCommand::Quit).await.unwrap();
+    };
+    let (supervised, ()) = tokio::join!(supervisor.run(), driver);
+    supervised.expect("supervisor run");
   })
   .await;
 }

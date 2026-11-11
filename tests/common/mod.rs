@@ -200,7 +200,7 @@ pub fn treasury(cfg: &NetworkConfig) -> Address {
 }
 
 /// A journal path no earlier context used.
-fn journal_path() -> std::path::PathBuf {
+pub fn journal_path() -> std::path::PathBuf {
   let nanos = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .map_or(0, |d| d.as_nanos());

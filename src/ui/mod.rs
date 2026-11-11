@@ -439,6 +439,24 @@ mod tests {
     assert_eq!(app.on_key(KeyCode::Char('q')), Some(UiCommand::Quit));
   }
 
+  /// An accepted reload replaces the config tab's text and a refused one keeps it.
+  #[test]
+  fn reload_replaces_config_text() {
+    let mut app = app();
+    app.on_reload(ReloadEvent {
+      error: Some("config: owner: index is outside the accounts list".into()),
+      ..Default::default()
+    });
+    assert_eq!(app.config, "kind = \"evm\"");
+    app.on_reload(ReloadEvent {
+      changes: vec!["min_profit".into()],
+      config: Some("kind = \"evm\"\nmin_profit = \"1\"".into()),
+      ..Default::default()
+    });
+    assert_eq!(app.config, "kind = \"evm\"\nmin_profit = \"1\"");
+    assert_eq!(app.log.back().unwrap(), "reload: min_profit");
+  }
+
   /// Wei print in token units with four places.
   #[test]
   fn amount_formatting() {

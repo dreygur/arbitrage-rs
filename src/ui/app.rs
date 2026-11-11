@@ -209,8 +209,11 @@ impl App {
     self.status = Some(status);
   }
 
-  /// Takes a reload outcome and notes it in the log.
-  pub fn on_reload(&mut self, reload: ReloadEvent) {
+  /// Takes a reload outcome, notes it in the log and shows an accepted config's text.
+  pub fn on_reload(&mut self, mut reload: ReloadEvent) {
+    if let Some(config) = reload.config.take() {
+      self.config = config;
+    }
     let line = match &reload.error {
       Some(error) => format!("reload refused: {error}"),
       None if reload.changes.is_empty() => "reload: nothing changed".to_string(),

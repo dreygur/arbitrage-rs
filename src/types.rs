@@ -300,8 +300,9 @@ pub struct AccountStatus {
   pub low_gas: bool,
 }
 
-/// Snapshot of the whole bot for the dashboard.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Snapshot of the whole bot for the dashboard. The default is the empty one the screen's
+/// channel starts with, replaced before the screen opens.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
   /// Latest block seen.
   pub block: u64,
@@ -335,6 +336,8 @@ pub struct ReloadEvent {
   pub changes: Vec<String>,
   /// Why the new config was refused, when it was.
   pub error: Option<String>,
+  /// The accepted config's text, so the config tab shows what now runs; absent when refused.
+  pub config: Option<String>,
 }
 
 #[cfg(test)]
