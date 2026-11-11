@@ -164,8 +164,8 @@ pub struct MockChain {
   pub submits: Mutex<Vec<Vec<Opportunity>>>,
   /// Number of `cost` calls.
   pub cost_calls: AtomicUsize,
-  /// Every command passed to `control`.
-  pub controls: Mutex<Vec<Control>>,
+  /// Every command passed to `control`, shareable like `in_flight`.
+  pub controls: Arc<Mutex<Vec<Control>>>,
   /// Value returned by `in_flight`, shareable so a test can hold it for a chain the code
   /// under test builds.
   pub in_flight: Arc<AtomicUsize>,
@@ -187,7 +187,7 @@ impl MockChain {
       replies: Mutex::new(VecDeque::new()),
       submits: Mutex::new(Vec::new()),
       cost_calls: AtomicUsize::new(0),
-      controls: Mutex::new(Vec::new()),
+      controls: Arc::new(Mutex::new(Vec::new())),
       in_flight: Arc::new(AtomicUsize::new(0)),
       lives: Mutex::new(Vec::new()),
       status: Arc::new(Mutex::new(Status {

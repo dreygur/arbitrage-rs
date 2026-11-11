@@ -4,6 +4,9 @@
 //! go to the running chain in place; any other change, or a restart the chain asks for,
 //! stops submitting, waits for trades in flight, drops the chain and builds a new one with
 //! the builder `main` picked by `kind`. A quit waits for trades in flight the same way.
+//!
+//! Closing the terminal sends `SIGHUP`, so under the screen it means a reload, not an exit;
+//! the run then ends when the screen fails and its command channel closes.
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -12,7 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::signal::unix::Signal;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -27,6 +30,9 @@ use crate::ui::UiCommand;
 const STATUS_EVERY: Duration = Duration::from_millis(200);
 /// How often a drain checks whether the trades in flight have settled.
 const DRAIN_POLL: Duration = Duration::from_millis(200);
+/// What the screen shows when a reread config fails to build. The build error is not
+/// shown or logged, since a transport error can quote the node URL, which may hold a key.
+const BUILD_FAILED: &str = "the new config failed to build, the running config was rebuilt";
 
 /// Waits until no trade is in flight or `timeout` blocks have passed, so neither a quit nor
 /// a restart abandons a trade the engine could still settle. Copies the status for the
@@ -97,6 +103,10 @@ fn read_config(path: &Path, network: &str) -> Result<(NetworkConfig, String)> {
 
 /// Loads `env_file` over the process env; a missing file is no error. A parse error is
 /// reported without its detail, since that quotes the line, which may hold a key.
+///
+/// Only that exact path is read: `main` passes `.env`, relative to the working directory,
+/// unlike its startup load, which also searches parent directories. The config path is
+/// relative too, so the bot runs from the repository root.
 fn reread_env(env_file: &Path) -> Result<()> {
   match dotenvy::from_path_override(env_file) {
     Ok(()) => Ok(()),
@@ -188,6 +198,13 @@ pub struct Supervisor<C: Chain, F, Fut> {
   bot: Arc<Bot<C>>,
   /// Whether the operator paused trading, so a restart keeps it paused.
   paused: bool,
+  /// Whether a sweep was asked for during a restart drain. It goes to the new chain, so
+  /// no owner transaction is left in flight on a chain about to be dropped; a quit that
+  /// replaces the restart drops it.
+  sweep_due: bool,
+  /// `SIGHUP`, installed by the caller before the first connect, so a hangup during it
+  /// does not kill the process.
+  hangup: Signal,
   /// Channels to the screen.
   links: Links,
   /// Ties the builder's future type to the struct.
@@ -200,11 +217,13 @@ where
   F: Fn(NetworkConfig) -> Fut,
   Fut: Future<Output = Result<C>>,
 {
-  /// Reads the config at `path` and builds the first chain and its bot.
+  /// Reads the config at `path` and builds the first chain and its bot. `hangup` is the
+  /// `SIGHUP` stream that asks for reloads.
   pub async fn new(
     network: String,
     path: PathBuf,
     env_file: PathBuf,
+    hangup: Signal,
     build: F,
     links: Links,
   ) -> Result<Self> {
@@ -228,6 +247,8 @@ where
       chain,
       bot,
       paused: false,
+      sweep_due: false,
+      hangup,
       links,
       future: PhantomData,
     })
@@ -246,6 +267,12 @@ where
   /// A config that fails to load or validate keeps the running one and is reported with
   /// its error. A live change goes to the bot and the chain at once. Any other change is
   /// held for the restart that `run` carries out, which reports it once the new chain runs.
+  /// Each successful reread replaces whatever restart config was held before, so the
+  /// latest edit is the one built.
+  ///
+  /// The env file is loaded before the TOML is read, so a refused TOML still leaves the
+  /// new env values in the process; a later restart the chain asks for then pairs the
+  /// running config with them.
   pub fn reload(&mut self) -> Result<Change> {
     let loaded = reread_env(&self.env_file).and_then(|()| read_config(&self.path, &self.network));
     let (cfg, text) = match loaded {
@@ -265,11 +292,16 @@ where
       changes: changed(&self.cfg, &cfg, fingerprint != self.fingerprint),
       error: None,
       config: Some(text),
+      executor_cap: Some(cfg.live.limits.executor_max_hold),
     };
     info!(?change, changes = ?event.changes, "config reread");
     match change {
-      Change::None => self.report(event),
+      Change::None => {
+        self.pending = None;
+        self.report(event);
+      }
       Change::Live => {
+        self.pending = None;
         self.bot.apply_live(cfg.live.clone());
         self.cfg = cfg;
         self.report(event);
@@ -338,9 +370,15 @@ where
     Ok(Next::Stop)
   }
 
-  /// Pauses the bot and lets its trades settle before a restart. A `q` meanwhile turns the
-  /// restart into a quit, which keeps waiting until a second `q`. A run that ends meanwhile
-  /// decides: a restart goes ahead, any other exit ends.
+  /// Pauses the bot and lets its trades settle before a restart, while still taking the
+  /// operator's commands, so none is lost to the restart:
+  /// - `p` and resume set the pause the new bot starts with; the old one stays paused.
+  /// - `r` or `SIGHUP` rereads, and the latest edit replaces the one held.
+  /// - A sweep is held for the new chain.
+  /// - `q` turns the restart into a quit, which keeps waiting until a second `q`; the
+  ///   screen going away turns it into a quit that waits in full.
+  ///
+  /// A run that ends meanwhile decides: a restart goes ahead, any other exit ends.
   async fn drain_for_restart<R>(&mut self, mut run: Pin<&mut R>) -> Result<Next>
   where
     R: Future<Output = Result<Exit>>,
@@ -350,19 +388,37 @@ where
       "restarting, waiting for trades in flight"
     );
     self.bot.set_paused(true);
-    match self.wait(run.as_mut(), true).await {
-      Drained::Settled => Ok(Next::Restart),
-      Drained::Forced => {
-        let asked = !self.links.commands.is_closed();
-        self.quit(run, asked).await
+    let chain = self.chain.clone();
+    let status = self.links.status.clone();
+    let drained = drain(&*chain, self.cfg.live.trade_timeout, &status);
+    tokio::pin!(drained);
+    loop {
+      let wake = tokio::select! {
+        exit = run.as_mut() => Wake::Exited(exit),
+        () = drained.as_mut() => return Ok(Next::Restart),
+        Some(()) = self.hangup.recv() => Wake::Hangup,
+        command = self.links.commands.recv() => Wake::Command(command),
+      };
+      match wake {
+        Wake::Exited(exit) => return self.exited(exit),
+        // The drain copies the status itself, so no tick is selected here.
+        Wake::Tick => {}
+        Wake::Hangup | Wake::Command(Some(UiCommand::Reload)) => {
+          // A refused config is reported by `reload`, and the held one still applies.
+          let _ = self.reload();
+        }
+        Wake::Command(Some(UiCommand::Pause)) => self.paused = true,
+        Wake::Command(Some(UiCommand::Resume)) => self.paused = false,
+        Wake::Command(Some(UiCommand::Sweep)) => self.sweep_due = true,
+        Wake::Command(Some(UiCommand::Quit)) => return self.quit(run, true).await,
+        Wake::Command(None) => return self.quit(run, false).await,
       }
-      Drained::Exited(exit) => self.exited(exit),
     }
   }
 
   /// Serves one chain: carries out screen commands, reloads on `r` or `SIGHUP` and copies
   /// the status for the screen, until the bot must stop or restart.
-  async fn serve<R>(&mut self, mut run: Pin<&mut R>, hangup: &mut Signal) -> Result<Next>
+  async fn serve<R>(&mut self, mut run: Pin<&mut R>) -> Result<Next>
   where
     R: Future<Output = Result<Exit>>,
   {
@@ -371,7 +427,7 @@ where
       let wake = tokio::select! {
         exit = run.as_mut() => Wake::Exited(exit),
         _ = tick.tick() => Wake::Tick,
-        Some(()) = hangup.recv() => Wake::Hangup,
+        Some(()) = self.hangup.recv() => Wake::Hangup,
         command = self.links.commands.recv() => Wake::Command(command),
       };
       match wake {
@@ -400,18 +456,36 @@ where
   }
 
   /// Drops the bot and the chain, then builds new ones from the pending config, or from
-  /// the running one when the chain asked for the restart, and reports the pending reload.
-  /// The new bot starts trading unless the operator had paused it.
+  /// the running one when there is none, and reports the outcome.
+  ///
+  /// A pending config can pass `reload` and still fail to build, on an adapter value or an
+  /// env var only the chain checks, or a node that is down. Then the screen is told, the
+  /// running config is built again, and only a failure of that ends the run. The new bot
+  /// starts trading unless the operator had paused it, and takes a sweep held meanwhile.
   async fn restart(mut self) -> Result<Self> {
     let pending = self.pending.take();
-    let (cfg, fingerprint) = match &pending {
-      Some(pending) => (pending.cfg.clone(), pending.fingerprint),
-      None => (self.cfg.clone(), self.fingerprint),
-    };
     drop(self.bot);
     drop(self.chain);
     info!("rebuilding the chain");
-    let chain = Arc::new((self.build)(cfg.clone()).await?);
+    let (chain, cfg, fingerprint, event) = match pending {
+      Some(pending) => match (self.build)(pending.cfg.clone()).await {
+        Ok(chain) => (chain, pending.cfg, pending.fingerprint, Some(pending.event)),
+        Err(_) => {
+          warn!("{BUILD_FAILED}");
+          let event = ReloadEvent {
+            error: Some(BUILD_FAILED.into()),
+            ..ReloadEvent::default()
+          };
+          let chain = (self.build)(self.cfg.clone()).await?;
+          (chain, self.cfg.clone(), self.fingerprint, Some(event))
+        }
+      },
+      None => {
+        let chain = (self.build)(self.cfg.clone()).await?;
+        (chain, self.cfg.clone(), self.fingerprint, None)
+      }
+    };
+    let chain = Arc::new(chain);
     let bot = Arc::new(Bot::new(
       chain.clone(),
       cfg.live.clone(),
@@ -420,16 +494,20 @@ where
     if self.paused {
       bot.set_paused(true);
     }
+    if self.sweep_due {
+      chain.control(Control::Sweep);
+    }
     info!("restarted");
     let restarted = Self {
       cfg,
       fingerprint,
       chain,
       bot,
+      sweep_due: false,
       ..self
     };
-    if let Some(pending) = pending {
-      restarted.report(pending.event);
+    if let Some(event) = event {
+      restarted.report(event);
     }
     Ok(restarted)
   }
@@ -437,13 +515,12 @@ where
   /// Runs the bot until a quit, the screen going away, or an exit that is not a restart,
   /// rebuilding the chain whenever a restart is due.
   pub async fn run(mut self) -> Result<()> {
-    let mut hangup = signal(SignalKind::hangup())?;
     loop {
       let next = {
         let bot = self.bot.clone();
         let run = async move { bot.run(None).await };
         tokio::pin!(run);
-        self.serve(run, &mut hangup).await?
+        self.serve(run).await?
       };
       match next {
         Next::Stop => return Ok(()),
@@ -459,6 +536,8 @@ mod tests {
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicUsize, Ordering};
 
+  use tokio::signal::unix::{SignalKind, signal};
+
   use super::*;
   use crate::testkit::MockChain;
   use crate::types::{Amount, Update};
@@ -473,47 +552,72 @@ mod tests {
   const TICK: Duration = Duration::from_millis(50);
   /// Env var a test names as its mnemonic, so changing it touches no other test.
   const TEST_ENV: &str = "ARB_SUPERVISOR_TEST_MNEMONIC";
+  /// A node URL carrying a key, quoted by a failing mock build.
+  const SECRET_URL: &str = "https://node.example/v2/SECRETKEY";
 
   /// Distinguishes the file sets of tests run in one process.
   static SEQ: AtomicUsize = AtomicUsize::new(0);
 
   /// What a test keeps of the chains the supervisor builds.
   struct Shared {
-    /// Chains built so far.
-    builds: AtomicUsize,
+    /// The config of every build attempt, in order, failed ones included.
+    configs: Mutex<Vec<NetworkConfig>>,
+    /// The controls each built chain received, by build attempt; a failed build gets an
+    /// empty list.
+    controls: Mutex<Vec<Arc<Mutex<Vec<Control>>>>>,
     /// In flight count every built chain reports.
     in_flight: Arc<AtomicUsize>,
     /// Status every built chain reports.
     status: Arc<Mutex<Status>>,
     /// Whether the first chain's feed asks for a restart.
     restart_first: bool,
+    /// The build attempt, counted from zero, that fails.
+    fail_build: Option<usize>,
   }
 
   impl Shared {
-    /// Chains built so far.
+    /// Build attempts so far.
     fn builds(&self) -> usize {
-      self.builds.load(Ordering::SeqCst)
+      self.configs.lock().unwrap().len()
+    }
+
+    /// The controls the chain of build attempt `index` received.
+    fn controls(&self, index: usize) -> Vec<Control> {
+      self.controls.lock().unwrap()[index].lock().unwrap().clone()
     }
   }
 
-  /// Fresh shared handles; the first chain asks for a restart when `restart_first` is set.
-  fn mock_shared(restart_first: bool) -> Arc<Shared> {
+  /// Fresh shared handles. The first chain asks for a restart when `restart_first` is set,
+  /// and build attempt `fail_build` fails.
+  fn mock_shared(restart_first: bool, fail_build: Option<usize>) -> Arc<Shared> {
     let chain = MockChain::new("base", Vec::new());
     Arc::new(Shared {
-      builds: AtomicUsize::new(0),
+      configs: Mutex::new(Vec::new()),
+      controls: Mutex::new(Vec::new()),
       in_flight: chain.in_flight.clone(),
       status: chain.status.clone(),
       restart_first,
+      fail_build,
     })
   }
 
-  /// A builder of mock chains that all report `shared`'s in flight count and status.
+  /// A builder of mock chains that all report `shared`'s in flight count and status. A
+  /// failing build's error quotes a node URL with a key, which must never reach the screen.
   fn mock_builder(shared: Arc<Shared>) -> impl Fn(NetworkConfig) -> Ready<Result<MockChain>> {
-    move |_cfg| {
+    move |cfg| {
+      let attempt = {
+        let mut configs = shared.configs.lock().unwrap();
+        configs.push(cfg);
+        configs.len() - 1
+      };
       let mut chain = MockChain::new("base", Vec::new());
+      shared.controls.lock().unwrap().push(chain.controls.clone());
+      if shared.fail_build == Some(attempt) {
+        return ready(Err(Error::Rpc(format!("{SECRET_URL} is down"))));
+      }
       chain.in_flight = shared.in_flight.clone();
       chain.status = shared.status.clone();
-      if shared.builds.fetch_add(1, Ordering::SeqCst) == 0 && shared.restart_first {
+      if attempt == 0 && shared.restart_first {
         chain.push_update(Ok(Update {
           restart: true,
           ..Default::default()
@@ -589,6 +693,7 @@ mod tests {
       NETWORK.into(),
       files.config.clone(),
       files.env.clone(),
+      signal(SignalKind::hangup()).unwrap(),
       mock_builder(shared),
       links,
     )
@@ -606,7 +711,7 @@ mod tests {
   #[tokio::test]
   async fn invalid_config_keeps_old() {
     let files = mock_files(ETHEREUM);
-    let shared = mock_shared(false);
+    let shared = mock_shared(false, None);
     let (mut supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     files.edit("owner = 0", "owner = 9");
     assert!(supervisor.reload().is_err());
@@ -628,7 +733,7 @@ mod tests {
   #[tokio::test]
   async fn threshold_change_applies_live() {
     let files = mock_files(ETHEREUM);
-    let shared = mock_shared(false);
+    let shared = mock_shared(false, None);
     let (mut supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     files.edit(
       "min_profit = \"1000000000000000\"",
@@ -648,7 +753,7 @@ mod tests {
   #[tokio::test]
   async fn gas_cap_change_applies_live() {
     let files = mock_files(ETHEREUM);
-    let shared = mock_shared(false);
+    let shared = mock_shared(false, None);
     let (mut supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     files.edit(
       "max_gas_cost = \"20000000000000000\"",
@@ -669,7 +774,7 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn env_change_restarts() {
     let files = mock_files(&ETHEREUM.replace("MNEMONIC_1", TEST_ENV));
-    let shared = mock_shared(false);
+    let shared = mock_shared(false, None);
     let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     let driver = async {
       std::fs::write(&files.env, format!("{TEST_ENV}=changed\n")).unwrap();
@@ -687,7 +792,7 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn restart_waits_for_in_flight() {
     let files = mock_files(ETHEREUM);
-    let shared = mock_shared(false);
+    let shared = mock_shared(false, None);
     shared.in_flight.store(1, Ordering::SeqCst);
     let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     let driver = async {
@@ -710,7 +815,7 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn restart_waits_at_most_timeout() {
     let files = mock_files(ETHEREUM);
-    let shared = mock_shared(false);
+    let shared = mock_shared(false, None);
     shared.in_flight.store(1, Ordering::SeqCst);
     let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     let driver = async {
@@ -733,7 +838,7 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn restart_update_rebuilds_chain() {
     let files = mock_files(ETHEREUM);
-    let shared = mock_shared(true);
+    let shared = mock_shared(true, None);
     let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
     let driver = async {
       while shared.builds() < 2 {
@@ -743,6 +848,56 @@ mod tests {
       assert_eq!(shared.builds(), 2);
       assert!(ends.reloads.try_recv().unwrap().changes.is_empty());
       assert!(ends.reloads.try_recv().is_err());
+      ends.commands.send(UiCommand::Quit).await.unwrap();
+    };
+    let (result, ()) = tokio::join!(supervisor.run(), driver);
+    result.unwrap();
+  }
+
+  /// A pending config whose build fails is reported with a terse error that quotes no node
+  /// URL, and the running config is built again instead, so the bot keeps going.
+  #[tokio::test(start_paused = true)]
+  async fn failed_build_keeps_running_config() {
+    let files = mock_files(ETHEREUM);
+    let shared = mock_shared(false, Some(1));
+    let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
+    let driver = async {
+      files.edit("gas_v2_v2 = 350000", "gas_v2_v2 = 360000");
+      ends.commands.send(UiCommand::Reload).await.unwrap();
+      let event = ends.reloads.recv().await.unwrap();
+      let error = event.error.unwrap();
+      assert!(!error.contains("SECRETKEY"), "{error}");
+      assert!(event.config.is_none());
+      assert_eq!(shared.builds(), 3);
+      let configs = shared.configs.lock().unwrap().clone();
+      assert_ne!(configs[1].adapter, configs[0].adapter);
+      assert_eq!(configs[2].adapter, configs[0].adapter);
+      ends.commands.send(UiCommand::Quit).await.unwrap();
+    };
+    let (result, ()) = tokio::join!(supervisor.run(), driver);
+    result.unwrap();
+  }
+
+  /// A pause and a sweep sent during a restart drain are not lost: the rebuilt bot starts
+  /// paused, and the sweep goes to the new chain rather than the one being dropped.
+  #[tokio::test(start_paused = true)]
+  async fn pause_during_drain_keeps_rebuilt_bot_paused() {
+    let files = mock_files(ETHEREUM);
+    let shared = mock_shared(false, None);
+    shared.in_flight.store(1, Ordering::SeqCst);
+    let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
+    let driver = async {
+      files.edit("gas_v2_v2 = 350000", "gas_v2_v2 = 360000");
+      ends.commands.send(UiCommand::Reload).await.unwrap();
+      tokio::time::sleep(SETTLE).await;
+      ends.commands.send(UiCommand::Pause).await.unwrap();
+      ends.commands.send(UiCommand::Sweep).await.unwrap();
+      tokio::time::sleep(SETTLE).await;
+      assert_eq!(shared.builds(), 1);
+      shared.in_flight.store(0, Ordering::SeqCst);
+      ends.reloads.recv().await.unwrap();
+      assert_eq!(shared.controls(0), vec![Control::Pause]);
+      assert_eq!(shared.controls(1), vec![Control::Pause, Control::Sweep]);
       ends.commands.send(UiCommand::Quit).await.unwrap();
     };
     let (result, ()) = tokio::join!(supervisor.run(), driver);

@@ -338,6 +338,9 @@ pub struct ReloadEvent {
   pub error: Option<String>,
   /// The accepted config's text, so the config tab shows what now runs; absent when refused.
   pub config: Option<String>,
+  /// The accepted config's `executor_max_hold`, so the holdings panel shows the cap that
+  /// now applies; absent when refused.
+  pub executor_cap: Option<Amount>,
 }
 
 #[cfg(test)]

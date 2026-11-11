@@ -14,6 +14,7 @@ use std::time::Instant;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::{SolCall, SolError};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
 use arbitrage::chain::Chain;
@@ -634,6 +635,7 @@ async fn reload_adds_operator() {
       NETWORK.into(),
       path.clone(),
       PathBuf::from(NO_ENV_FILE),
+      signal(SignalKind::hangup()).expect("SIGHUP handler"),
       build,
       links,
     )

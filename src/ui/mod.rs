@@ -439,7 +439,8 @@ mod tests {
     assert_eq!(app.on_key(KeyCode::Char('q')), Some(UiCommand::Quit));
   }
 
-  /// An accepted reload replaces the config tab's text and a refused one keeps it.
+  /// An accepted reload replaces the config tab's text and the executor cap, and a refused
+  /// one keeps both.
   #[test]
   fn reload_replaces_config_text() {
     let mut app = app();
@@ -448,12 +449,15 @@ mod tests {
       ..Default::default()
     });
     assert_eq!(app.config, "kind = \"evm\"");
+    assert_eq!(app.executor_cap, Amount::from(ETHER));
     app.on_reload(ReloadEvent {
       changes: vec!["min_profit".into()],
       config: Some("kind = \"evm\"\nmin_profit = \"1\"".into()),
+      executor_cap: Some(Amount::from(2 * ETHER)),
       ..Default::default()
     });
     assert_eq!(app.config, "kind = \"evm\"\nmin_profit = \"1\"");
+    assert_eq!(app.executor_cap, Amount::from(2 * ETHER));
     assert_eq!(app.log.back().unwrap(), "reload: min_profit");
   }
 

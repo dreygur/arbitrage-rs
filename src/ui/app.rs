@@ -209,10 +209,14 @@ impl App {
     self.status = Some(status);
   }
 
-  /// Takes a reload outcome, notes it in the log and shows an accepted config's text.
+  /// Takes a reload outcome, notes it in the log and shows an accepted config's text and
+  /// executor cap.
   pub fn on_reload(&mut self, mut reload: ReloadEvent) {
     if let Some(config) = reload.config.take() {
       self.config = config;
+    }
+    if let Some(cap) = reload.executor_cap {
+      self.executor_cap = cap;
     }
     let line = match &reload.error {
       Some(error) => format!("reload refused: {error}"),

@@ -34,6 +34,7 @@ use alloy::primitives::{Address, B256, TxKind, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::chain::Chain;
@@ -209,6 +210,8 @@ pub struct EvmChain {
   feed: FeedHandle,
   /// Commands to the engine task, in the order they must run.
   commands: mpsc::UnboundedSender<EngineCmd>,
+  /// The engine task, until [`EvmChain::take_engine`] hands it out.
+  engine: Mutex<Option<JoinHandle<()>>>,
   /// Set when a head went to the engine and its maintenance has not: it follows the next
   /// submit, or goes at the start of the next `changes` when the bot submitted nothing.
   maintenance_due: AtomicBool,
@@ -308,7 +311,7 @@ impl EvmChain {
       first_id,
     )
     .with_forward_gas(forward_gas);
-    let (commands, published) = engine.spawn();
+    let (commands, published, engine_task) = engine.spawn();
     let base = to_id(weth);
     let snapshots = state.snapshots();
     let pairs: HashSet<&Id> = snapshots
@@ -339,12 +342,20 @@ impl EvmChain {
       snapshots: RwLock::new(snapshots),
       feed,
       commands,
+      engine: Mutex::new(Some(engine_task)),
       maintenance_due: AtomicBool::new(false),
       published,
       feed_lag_ms: AtomicU64::new(0),
       last_block: Mutex::new(None),
     };
     Ok((chain, trades))
+  }
+
+  /// Hands out the engine task once. The task ends after this chain is dropped and the
+  /// commands already queued have run, so a restart that awaits it before connecting
+  /// again never has two engines planning ledger ids from the same journal.
+  pub fn take_engine(&self) -> Option<JoinHandle<()>> {
+    self.engine.lock().unwrap_or_else(|e| e.into_inner()).take()
   }
 
   /// Queues `command` for the engine, behind every command sent before it.
@@ -615,6 +626,7 @@ mod tests {
       snapshots: RwLock::new(Vec::new()),
       feed: FeedHandle::detached(),
       commands: commands_tx,
+      engine: Mutex::new(None),
       maintenance_due: AtomicBool::new(false),
       published: published_rx,
       feed_lag_ms: AtomicU64::new(0),

@@ -4,6 +4,8 @@
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arbitrage::bot::Decision;
 use arbitrage::chain::evm::EvmChain;
@@ -13,8 +15,10 @@ use arbitrage::supervisor::{Links, Supervisor};
 use arbitrage::types::{Status, TradeEvent, Verdict};
 use arbitrage::ui::app::App;
 use arbitrage::ui::{UiLog, run_ui};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -33,8 +37,10 @@ const RELOADS: usize = 16;
 const COMMANDS: usize = 16;
 /// Trade events buffered for the screen.
 const TRADES: usize = 1024;
-/// The env file a reload rereads.
+/// The env file a reload rereads, relative to the working directory.
 const ENV_FILE: &str = ".env";
+/// Longest a restart waits for the old engine to finish its queued commands.
+const ENGINE_STOP: Duration = Duration::from_secs(30);
 /// Flag that runs with logs only.
 const HEADLESS: &str = "--headless";
 
@@ -88,10 +94,23 @@ async fn forward_trades(mut trades: mpsc::Receiver<TradeEvent>, screen: mpsc::Se
   }
 }
 
+/// Waits for the engine of the chain the supervisor just dropped, so its queued commands
+/// and their ledger ids are done before the next connect reads the journal. A wait past
+/// [`ENGINE_STOP`] is logged and given up, so a stuck engine cannot block the restart.
+async fn stop_engine(engine: &Mutex<Option<JoinHandle<()>>>) {
+  let task = engine.lock().unwrap_or_else(|e| e.into_inner()).take();
+  if let Some(task) = task
+    && tokio::time::timeout(ENGINE_STOP, task).await.is_err()
+  {
+    warn!("the old engine did not stop in time, connecting anyway");
+  }
+}
+
 /// Supervises the bot on `network` until it stops: with logs only when `logs` is absent,
 /// under the screen fed by `logs` otherwise. The screen opens once the first chain is
 /// connected and closes when the supervisor is done.
 async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> {
+  let hangup = signal(SignalKind::hangup())?;
   let path = PathBuf::from(format!("config/{network}.toml"));
   let cfg = NetworkConfig::load(network)?;
   let (decisions, decided) = mpsc::channel(DECISIONS);
@@ -109,11 +128,15 @@ async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> 
   let supervisor = match cfg.kind {
     ChainKind::Evm => {
       let name = network.to_string();
+      let engine = Arc::new(Mutex::new(None));
       let build = move |cfg: NetworkConfig| {
         let name = name.clone();
         let screen_trades = screen_trades.clone();
+        let engine = engine.clone();
         async move {
+          stop_engine(&engine).await;
           let (chain, events) = EvmChain::connect(&cfg, &name).await?;
+          *engine.lock().unwrap_or_else(|e| e.into_inner()) = chain.take_engine();
           match screen_trades {
             Some(screen) => tokio::spawn(forward_trades(events, screen)),
             None => tokio::spawn(log_trades(events)),
@@ -122,7 +145,15 @@ async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> 
         }
       };
       let env_file = PathBuf::from(ENV_FILE);
-      Supervisor::new(network.to_string(), path.clone(), env_file, build, links).await?
+      Supervisor::new(
+        network.to_string(),
+        path.clone(),
+        env_file,
+        hangup,
+        build,
+        links,
+      )
+      .await?
     }
   };
   let Some(logs) = logs else {
