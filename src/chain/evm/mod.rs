@@ -370,9 +370,9 @@ impl EvmChain {
   /// reload first checks that the executor still has code, whether a feed gap or a skipped
   /// block asked for it, since a fork reset before the feed's first head shows up only as a
   /// skip. When the code is gone the chain asks for a restart and skips the reload, since the
-  /// chain is about to be rebuilt and rereading every pool of a reset fork is the slow part. Pools near their tick window's edge get a
-  /// refetch, then the engine gets the head, which it handles without RPC; its maintenance is
-  /// held back until after the submit.
+  /// chain is about to be rebuilt and rereading every pool of a reset fork is the slow part.
+  /// Pools near their tick window's edge get a refetch, then the engine gets the head, which
+  /// it handles without RPC; its maintenance is held back until after the submit.
   ///
   /// The block counts as read once state reflects it, so a reload's time is in the read
   /// stage of a trade's latency rather than in the decision.
