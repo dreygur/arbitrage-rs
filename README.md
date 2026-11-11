@@ -10,7 +10,11 @@ Captured from a live fork run.
 
 ![Main screen](docs/images/main.png)
 
-The main screen after two executed trades, +0.5078 and +0.9355 ETH. The executor swept 1.3433 ETH to the treasury.
+The main screen after two executed trades, +0.5310 and +0.9195 ETH. The executor swept 1.3506 ETH to the treasury. The opportunities panel keeps recent decisions across blocks.
+
+![Connecting](docs/images/connecting.png)
+
+Startup: the screen shows the connect while pools load, before any trading.
 
 ![First trade](docs/images/first-trade.png)
 
