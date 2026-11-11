@@ -89,7 +89,7 @@ fn trade_lines(event: &TradeEvent) -> Vec<String> {
   let detail = &event.detail;
   let mut lines = vec![
     format!(
-      "Send     account {}  nonce {}  gas limit {}  fee cap {} gwei  tip {} gwei  floor {}",
+      "Send     account {}  nonce {}  gas limit {}  fee cap {} gwei  tip {} gwei  floor {} ETH",
       event.account,
       event.nonce,
       or_dash(detail.gas_limit),
@@ -98,7 +98,7 @@ fn trade_lines(event: &TradeEvent) -> Vec<String> {
       or_dash(detail.floor.map(money)),
     ),
     format!(
-      "Result   {:?}  tx {}  block {}  gas used {}  actual profit {}  revert {}",
+      "Result   {:?}  tx {}  block {}  gas used {}  actual profit {} ETH  revert {}",
       event.state,
       or_dash(event.tx.as_deref()),
       or_dash(detail.mined_block),
@@ -139,7 +139,7 @@ fn lines(app: &App, decision: &Decision) -> Vec<String> {
     return lines;
   };
   lines.push(format!(
-    "Size     {}  profit {}  gas {}  floor {}",
+    "Size     {} ETH  profit {} ETH  gas {} ETH  floor {} ETH",
     money(op.amount),
     money(op.profit),
     money(decision.cost),
@@ -147,12 +147,12 @@ fn lines(app: &App, decision: &Decision) -> Vec<String> {
   ));
   lines.push(match legs(decision, op, base) {
     Ok((bought, back)) => format!(
-      "Legs     buy gives {bought} token units, sell returns {}",
+      "Legs     buy gives {bought} token units, sell returns {} ETH",
       money(back)
     ),
     Err(error) => format!("Legs     quote failed: {error}"),
   });
-  lines.push("Profit by size".into());
+  lines.push("Profit by size (ETH)".into());
   lines.extend(curve(decision, op, base));
   match trade_for(app, op) {
     Some(event) => lines.extend(trade_lines(event)),

@@ -346,6 +346,38 @@ mod tests {
     assert!(!header.contains("running"), "{header}");
   }
 
+  /// Every ETH column and total names its unit, fees say gwei and gas used stays a count,
+  /// with no header cut at 200 columns.
+  #[test]
+  fn amounts_carry_units() {
+    let mut app = app();
+    app.on_decision(decision(ETHER / 10, Verdict::Sent));
+    app.on_trade(trade(
+      ETHER / 10,
+      TradeState::Executed,
+      TradeDetail {
+        quoted_profit: Some(Amount::from(ETHER / 100)),
+        gas_used: Some(210_000),
+        ..Default::default()
+      },
+    ));
+    let text = screen(|frame| draw(frame, &app));
+    for part in [
+      "size ETH",
+      "profit ETH",
+      "gas ETH",
+      "net ETH",
+      "expected ETH",
+      "actual ETH",
+      "gas used",
+      " ETH  gross ",
+      " ETH  gas ",
+    ] {
+      assert!(text.contains(part), "missing {part}:\n{text}");
+    }
+    assert!(!text.contains("gas used ETH"), "{text}");
+  }
+
   /// A trade row shows the quoted and the realised profit side by side.
   #[test]
   fn trade_row_shows_expected_and_actual() {

@@ -167,7 +167,7 @@ fn header(app: &App) -> String {
 fn totals(app: &App) -> String {
   let t = &app.totals;
   format!(
-    "net {}  gross {}  gas {}  executed {}  reverted {}  dropped {}",
+    "net {} ETH  gross {} ETH  gas {} ETH  executed {}  reverted {}  dropped {}",
     format_net(t.gross, t.gas),
     format_amount(t.gross, BASE_DECIMALS),
     format_amount(t.gas, BASE_DECIMALS),
@@ -184,7 +184,7 @@ fn holdings(app: &App) -> String {
   };
   let ready = status.accounts.iter().filter(|a| !a.low_gas).count();
   format!(
-    "executor {} / {}  treasury {}  accounts ready {}/{}",
+    "executor {} / {} ETH  treasury {} ETH  accounts ready {}/{}",
     format_amount(status.executor_balance, BASE_DECIMALS),
     format_amount(app.executor_cap, BASE_DECIMALS),
     format_amount(status.treasury_balance, BASE_DECIMALS),
@@ -227,14 +227,14 @@ fn opportunities(frame: &mut Frame, app: &App, area: Rect) {
     Constraint::Length(16),
     Constraint::Fill(1),
     Constraint::Fill(1),
-    Constraint::Length(10),
-    Constraint::Length(10),
-    Constraint::Length(10),
-    Constraint::Length(10),
+    Constraint::Length(12),
+    Constraint::Length(12),
+    Constraint::Length(12),
+    Constraint::Length(12),
     Constraint::Length(VERDICT_WIDTH),
   ];
   let header = Row::new(vec![
-    "block", "pair", "buy", "sell", "size", "profit", "gas", "net", "verdict",
+    "block", "pair", "buy", "sell", "size ETH", "profit ETH", "gas ETH", "net ETH", "verdict",
   ]);
   let table = Table::new(rows, widths)
     .header(header.style(Style::new().add_modifier(Modifier::BOLD)))
@@ -281,13 +281,22 @@ fn trades(frame: &mut Frame, app: &App, area: Rect) {
     Constraint::Length(16),
     Constraint::Length(9),
     Constraint::Length(16),
-    Constraint::Length(10),
-    Constraint::Length(10),
+    Constraint::Length(12),
+    Constraint::Length(12),
     Constraint::Length(9),
     Constraint::Length(10),
   ];
   let header = Row::new(vec![
-    "id", "kind", "pair", "account", "state", "tx", "expected", "actual", "gas used", "latency",
+    "id",
+    "kind",
+    "pair",
+    "account",
+    "state",
+    "tx",
+    "expected ETH",
+    "actual ETH",
+    "gas used",
+    "latency",
   ]);
   let table = Table::new(rows, widths)
     .header(header.style(Style::new().add_modifier(Modifier::BOLD)))
