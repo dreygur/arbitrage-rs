@@ -22,6 +22,8 @@ const PLACES: u8 = 4;
 const SHORT_KEEP: usize = 6;
 /// Basis points in one whole, for the spread on the pairs tab.
 const BPS: u64 = 10_000;
+/// Width of the verdict column: `locked #` and an eight digit block.
+pub const VERDICT_WIDTH: u16 = 16;
 /// The key help shown on the last row.
 const KEYS: &str =
   "tab page  up/down select  enter detail  p pause/resume  s sweep  r reload  f filter  q quit";
@@ -95,7 +97,7 @@ pub fn verdict_label(verdict: Verdict) -> String {
 /// Whether the bot is running, paused or draining before exit.
 fn run_state(app: &App) -> &'static str {
   if app.stopping {
-    "stopping"
+    "stopping, q again to force"
   } else if app.paused {
     "paused"
   } else {
@@ -210,7 +212,7 @@ fn opportunities(frame: &mut Frame, app: &App, area: Rect) {
     Constraint::Length(10),
     Constraint::Length(10),
     Constraint::Length(10),
-    Constraint::Length(13),
+    Constraint::Length(VERDICT_WIDTH),
   ];
   let header = Row::new(vec![
     "pair", "buy", "sell", "size", "profit", "gas", "net", "verdict",
@@ -361,7 +363,7 @@ fn pairs_tab(frame: &mut Frame, app: &App, area: Rect) {
     Constraint::Fill(1),
     Constraint::Length(11),
     Constraint::Length(11),
-    Constraint::Length(13),
+    Constraint::Length(VERDICT_WIDTH),
   ];
   let header = Row::new(vec!["buy", "sell", "spread bps", "last block", "verdict"]);
   let table = Table::new(rows, widths)

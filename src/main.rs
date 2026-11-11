@@ -107,29 +107,55 @@ async fn drain<C: Chain>(chain: &C, timeout: u64) {
   }
 }
 
+/// Returns at a second `q` (or Ctrl+C) or when the screen goes away, the operator's way out
+/// of a drain that waits on blocks that may never come.
+async fn forced(commands: &mut mpsc::Receiver<UiCommand>) {
+  while let Some(command) = commands.recv().await {
+    if command == UiCommand::Quit {
+      return;
+    }
+  }
+}
+
 /// Carries out screen commands until `q`, or until the screen goes away, then pauses the bot
 /// and lets its trades settle.
+///
+/// After a `q` the drain can be cut short by [`forced`]. After the screen goes away it
+/// cannot, since a closed channel would end the wait at once. The caller races this against
+/// `bot.run`, so a run that ends meanwhile drops the drain; Task 20's supervisor owns that
+/// choice.
 async fn serve<C: Chain>(
   commands: &mut mpsc::Receiver<UiCommand>,
   bot: &Bot<C>,
   chain: &C,
   timeout: u64,
 ) {
-  loop {
+  let asked = loop {
     match commands.recv().await {
       Some(UiCommand::Pause) => bot.set_paused(true),
       Some(UiCommand::Resume) => bot.set_paused(false),
       Some(UiCommand::Sweep) => chain.control(Control::Sweep),
       Some(UiCommand::Reload) => warn!("reload arrives with the supervisor"),
-      Some(UiCommand::Quit) | None => break,
+      Some(UiCommand::Quit) => break true,
+      None => break false,
     }
-  }
+  };
   info!(
     in_flight = chain.in_flight(),
     "stopping, waiting for trades in flight"
   );
   bot.set_paused(true);
-  drain(chain, timeout).await;
+  if !asked {
+    drain(chain, timeout).await;
+    return;
+  }
+  tokio::select! {
+    () = drain(chain, timeout) => {}
+    () = forced(commands) => warn!(
+      in_flight = chain.in_flight(),
+      "quitting without waiting for trades in flight"
+    ),
+  }
 }
 
 /// Runs the bot under the screen until `q` or the bot ends, then closes the screen.

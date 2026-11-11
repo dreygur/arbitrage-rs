@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 
@@ -103,6 +103,16 @@ impl Inputs {
   }
 }
 
+/// The key a key press means to the screen. Raw mode turns Ctrl+C into a plain key instead
+/// of a signal, so it is read as `q` to keep it a way out.
+fn key_code(key: &KeyEvent) -> KeyCode {
+  if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    KeyCode::Char('q')
+  } else {
+    key.code
+  }
+}
+
 /// Draws and reads keys until the command receiver is dropped, which is how the runner says
 /// it has finished.
 fn event_loop(
@@ -123,10 +133,12 @@ fn event_loop(
     if event::poll(FRAME)?
       && let Event::Key(key) = event::read()?
       && key.kind == KeyEventKind::Press
-      && let Some(command) = app.on_key(key.code)
-      && commands.try_send(command).is_err()
+      && let Some(command) = app.on_key(key_code(&key))
     {
-      app.on_log(format!("{command:?} not delivered, the runner is busy"));
+      match commands.try_send(command) {
+        Ok(()) => app.delivered(command),
+        Err(_) => app.on_log(format!("{command:?} not delivered, the runner is busy")),
+      }
     }
   }
   Ok(())
@@ -135,7 +147,8 @@ fn event_loop(
 /// Runs the screen at ten frames a second until the runner drops `commands`.
 ///
 /// The terminal is restored when the loop ends or fails, and by ratatui's panic hook on a
-/// panic.
+/// panic. That hook covers every thread in the process: a panic in another task restores
+/// the terminal while this loop keeps drawing to the plain screen until `q`.
 pub fn run_ui(
   app: App,
   decisions: mpsc::Receiver<Decision>,
@@ -164,11 +177,10 @@ mod tests {
 
   use ratatui::Terminal;
   use ratatui::backend::TestBackend;
-  use ratatui::crossterm::event::KeyCode;
 
   use super::app::App;
   use super::detail::draw_detail;
-  use super::views::{draw, format_amount};
+  use super::views::{VERDICT_WIDTH, draw, format_amount};
   use super::*;
   use crate::bot::Decision;
   use crate::testkit::MockVenue;
@@ -262,37 +274,36 @@ mod tests {
     text
   }
 
-  /// Every verdict reaches the opportunities panel under its own label.
+  /// The last column of an opportunities row, inside the panel border, trimmed.
+  fn verdict_cell(row: &str) -> String {
+    let inner: Vec<char> = row.trim_end().trim_end_matches('│').chars().collect();
+    let start = inner.len().saturating_sub(usize::from(VERDICT_WIDTH));
+    inner[start..].iter().collect::<String>().trim().to_string()
+  }
+
+  /// Every verdict reaches the opportunities panel under its own label, uncut.
   #[test]
   fn opportunities_show_verdicts() {
-    let mut app = app();
-    let verdicts = [
-      Verdict::Sent,
-      Verdict::BelowMin,
-      Verdict::GasExceedsProfit,
-      Verdict::GasCap,
-      Verdict::QuoteError,
-      Verdict::Locked(19),
-      Verdict::LowGas,
-      Verdict::CircuitOpen,
-      Verdict::Paused,
+    let cases = [
+      (Verdict::Sent, "SENT"),
+      (Verdict::BelowMin, "skip: min"),
+      (Verdict::GasExceedsProfit, "skip: gas"),
+      (Verdict::GasCap, "skip: gas cap"),
+      (Verdict::QuoteError, "skip: quote"),
+      (Verdict::Locked(24_123_456), "locked #24123456"),
+      (Verdict::LowGas, "skip: low gas"),
+      (Verdict::CircuitOpen, "breaker"),
+      (Verdict::Paused, "paused"),
     ];
-    for verdict in verdicts {
+    for (verdict, label) in cases {
+      let mut app = app();
       app.on_decision(decision(ETHER / 10, verdict));
-    }
-    let text = screen(|frame| draw(frame, &app));
-    for label in [
-      "SENT",
-      "skip: min",
-      "skip: gas",
-      "skip: gas cap",
-      "skip: quote",
-      "locked #19",
-      "skip: low gas",
-      "breaker",
-      "paused",
-    ] {
-      assert!(text.contains(label), "missing {label}:\n{text}");
+      let text = screen(|frame| draw(frame, &app));
+      let row = text
+        .lines()
+        .find(|line| line.contains("mock a"))
+        .unwrap_or_else(|| panic!("no opportunity row:\n{text}"));
+      assert_eq!(verdict_cell(row), label, "{row}");
     }
   }
 
@@ -388,10 +399,43 @@ mod tests {
   fn keys_map_to_commands() {
     let mut app = app();
     assert_eq!(app.on_key(KeyCode::Char('p')), Some(UiCommand::Pause));
+    app.delivered(UiCommand::Pause);
     assert_eq!(app.on_key(KeyCode::Char('p')), Some(UiCommand::Resume));
     assert_eq!(app.on_key(KeyCode::Char('s')), Some(UiCommand::Sweep));
     assert_eq!(app.on_key(KeyCode::Char('r')), Some(UiCommand::Reload));
     assert_eq!(app.on_key(KeyCode::Char('f')), None);
+    assert_eq!(app.on_key(KeyCode::Char('q')), Some(UiCommand::Quit));
+  }
+
+  /// The shown paused flag only changes once the runner has the command.
+  #[test]
+  fn undelivered_pause_keeps_running() {
+    let mut app = app();
+    assert_eq!(app.on_key(KeyCode::Char('p')), Some(UiCommand::Pause));
+    assert!(!app.paused);
+    assert_eq!(app.on_key(KeyCode::Char('p')), Some(UiCommand::Pause));
+    app.delivered(UiCommand::Pause);
+    assert!(app.paused);
+  }
+
+  /// Ctrl+C quits like `q`, since raw mode turns it into a plain key.
+  #[test]
+  fn ctrl_c_quits() {
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(key_code(&ctrl_c), KeyCode::Char('q'));
+    let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert_eq!(key_code(&plain_c), KeyCode::Char('c'));
+  }
+
+  /// While draining the header offers a forced quit, and a second `q` still asks for one.
+  #[test]
+  fn second_quit_forces() {
+    let mut app = app();
+    assert_eq!(app.on_key(KeyCode::Char('q')), Some(UiCommand::Quit));
+    app.delivered(UiCommand::Quit);
+    let text = screen(|frame| draw(frame, &app));
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("stopping, q again to force"), "{header}");
     assert_eq!(app.on_key(KeyCode::Char('q')), Some(UiCommand::Quit));
   }
 

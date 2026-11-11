@@ -145,7 +145,7 @@ pub struct App {
   pub detail: Option<Decision>,
   /// Whether the operator paused trading from this screen.
   pub paused: bool,
-  /// Whether the operator asked to quit and the bot is draining.
+  /// Whether the runner took a quit and the bot is draining.
   pub stopping: bool,
 }
 
@@ -248,23 +248,29 @@ impl App {
     self.detail = visible.get(row).map(|decision| (*decision).clone());
   }
 
-  /// Applies a key to the screen and returns the command it asks of the bot, if any.
+  /// Records a command the runner accepted, so the run state shown is the one the bot has
+  /// rather than the one a key asked for.
+  pub fn delivered(&mut self, command: UiCommand) {
+    match command {
+      UiCommand::Pause => self.paused = true,
+      UiCommand::Resume => self.paused = false,
+      UiCommand::Quit => self.stopping = true,
+      UiCommand::Sweep | UiCommand::Reload => {}
+    }
+  }
+
+  /// Applies a key to the screen and returns the command it asks of the bot, if any. Run
+  /// state changes wait for [`App::delivered`].
   pub fn on_key(&mut self, key: KeyCode) -> Option<UiCommand> {
     match key {
-      KeyCode::Char('p') => {
-        self.paused = !self.paused;
-        Some(if self.paused {
-          UiCommand::Pause
-        } else {
-          UiCommand::Resume
-        })
-      }
+      KeyCode::Char('p') => Some(if self.paused {
+        UiCommand::Resume
+      } else {
+        UiCommand::Pause
+      }),
       KeyCode::Char('s') => Some(UiCommand::Sweep),
       KeyCode::Char('r') => Some(UiCommand::Reload),
-      KeyCode::Char('q') => {
-        self.stopping = true;
-        Some(UiCommand::Quit)
-      }
+      KeyCode::Char('q') => Some(UiCommand::Quit),
       KeyCode::Char('f') => {
         self.filter = self.filter.next();
         self.selected = 0;
