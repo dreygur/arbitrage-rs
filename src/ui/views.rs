@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Paragraph, Row, Table, TableState};
 
 use super::app::{App, Tab};
 use crate::bot::Decision;
-use crate::types::{Amount, Role, Verdict};
+use crate::types::{Amount, Phase, Role, Verdict};
 
 /// Decimals of the base token and of the native token, both 18 on every chain run today.
 pub const BASE_DECIMALS: u8 = 18;
@@ -94,10 +94,14 @@ pub fn verdict_label(verdict: Verdict) -> String {
   }
 }
 
-/// Whether the bot is running, paused or draining before exit.
+/// Whether the bot is connecting, rebuilding, running, paused or draining before exit.
 fn run_state(app: &App) -> &'static str {
   if app.stopping {
     "stopping, q again to force"
+  } else if app.phase == Phase::Connecting {
+    "not trading yet"
+  } else if app.phase == Phase::Rebuilding {
+    "rebuilding, loading pools"
   } else if app.paused {
     "paused"
   } else {
@@ -124,25 +128,23 @@ fn tab_names(tab: Tab) -> String {
   .join(" ")
 }
 
-/// Network, block, feed lag, next base fee, the fee cap against its ceiling and run state.
+/// Network, block, feed lag, next base fee, the fee cap against its ceiling and run state;
+/// while the first chain is built, which can take minutes, a line saying so instead.
 fn header(app: &App) -> String {
-  let chain = match &app.status {
-    Some(status) => format!(
-      "block {}  lag {}ms  base {} gwei  fee cap {} / {} gwei",
+  let chain = match (&app.status, app.phase) {
+    (_, Phase::Connecting) => format!("connecting to {}, loading pools", app.network),
+    (Some(status), _) => format!(
+      "{}  block {}  lag {}ms  base {} gwei  fee cap {} / {} gwei",
+      app.network,
       status.block,
       status.feed_lag_ms,
       format_gwei(status.next_base_fee),
       format_gwei(status.fee_cap),
       format_gwei(status.max_fee_per_gas),
     ),
-    None => "waiting for status".to_string(),
+    (None, _) => format!("{}  waiting for status", app.network),
   };
-  format!(
-    "{}  {chain}  {}  {}",
-    app.network,
-    run_state(app),
-    tab_names(app.tab)
-  )
+  format!("{chain}  {}  {}", run_state(app), tab_names(app.tab))
 }
 
 /// Net, gross and gas sums and the settled trade counts.

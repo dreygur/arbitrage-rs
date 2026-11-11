@@ -30,7 +30,7 @@ use arbitrage::chain::evm::venue::v4::{V4Key, virtual_base_reserve};
 use arbitrage::config::{NetworkConfig, PairMode};
 use arbitrage::journal::read_last;
 use arbitrage::supervisor::{Links, Supervisor};
-use arbitrage::types::{Amount, EntryKind, Id, Status, TradeState, Verdict};
+use arbitrage::types::{Amount, EntryKind, Id, Phase, Status, TradeState, Verdict};
 use arbitrage::ui::UiCommand;
 use arbitrage::venue::Venue;
 
@@ -621,11 +621,13 @@ async fn reload_adds_operator() {
     let (commands, command_rx) = mpsc::channel(LINKS);
     let (reloads, mut reload_rx) = mpsc::channel(LINKS);
     let (status, _status_rx) = watch::channel(Status::default());
+    let (phase, _phase_rx) = watch::channel(Phase::Connecting);
     let links = Links {
       decisions,
       commands: command_rx,
       reloads,
       status,
+      phase,
     };
     let build = |cfg: NetworkConfig| async move {
       let (chain, _events) = EvmChain::connect(&cfg, NETWORK).await?;
@@ -640,7 +642,8 @@ async fn reload_adds_operator() {
       links,
     )
     .await
-    .expect("supervisor");
+    .expect("supervisor")
+    .expect("not quit");
     let record = PathBuf::from(format!(".arbitrage-{NETWORK}.json"));
     let executor = read_record(&record).unwrap().expect("record").address;
     let contract = FlashArbitrage::new(executor, &provider);

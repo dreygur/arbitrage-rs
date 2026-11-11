@@ -300,8 +300,21 @@ pub struct AccountStatus {
   pub low_gas: bool,
 }
 
+/// Where the supervisor is in building and running a chain, so the screen can tell a
+/// connect or rebuild that takes minutes from a hang.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+  /// The first chain is being built; nothing has a status yet.
+  #[default]
+  Connecting,
+  /// A restart dropped the chain and is building the next one.
+  Rebuilding,
+  /// A chain is built and the bot runs over it.
+  Running,
+}
+
 /// Snapshot of the whole bot for the dashboard. The default is the empty one the screen's
-/// channel starts with, replaced before the screen opens.
+/// channel starts with, shown as zeros until the first chain is built.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
   /// Latest block seen.

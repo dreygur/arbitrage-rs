@@ -20,7 +20,7 @@ use self::detail::draw_detail;
 use self::views::draw;
 use crate::bot::Decision;
 use crate::error::Result;
-use crate::types::{ReloadEvent, Status, TradeEvent};
+use crate::types::{Phase, ReloadEvent, Status, TradeEvent};
 
 /// Time between frames, for ten frames a second; also the longest a key waits to be seen.
 const FRAME: Duration = Duration::from_millis(100);
@@ -71,17 +71,19 @@ impl Write for UiLog {
 }
 
 /// The channels the screen reads each frame.
-struct Inputs {
+pub struct Inputs {
   /// Decisions from the bot.
-  decisions: mpsc::Receiver<Decision>,
+  pub decisions: mpsc::Receiver<Decision>,
   /// Trade events from the chain.
-  events: mpsc::Receiver<TradeEvent>,
+  pub events: mpsc::Receiver<TradeEvent>,
   /// The latest chain status.
-  status: watch::Receiver<Status>,
+  pub status: watch::Receiver<Status>,
+  /// Whether a chain is being built or runs.
+  pub phase: watch::Receiver<Phase>,
   /// Reload outcomes.
-  reloads: mpsc::Receiver<ReloadEvent>,
+  pub reloads: mpsc::Receiver<ReloadEvent>,
   /// Log lines from [`UiLog`].
-  logs: mpsc::Receiver<String>,
+  pub logs: mpsc::Receiver<String>,
 }
 
 impl Inputs {
@@ -100,6 +102,7 @@ impl Inputs {
       app.on_log(line);
     }
     app.on_status(self.status.borrow_and_update().clone());
+    app.phase = *self.phase.borrow_and_update();
   }
 }
 
@@ -149,22 +152,7 @@ fn event_loop(
 /// The terminal is restored when the loop ends or fails, and by ratatui's panic hook on a
 /// panic. That hook covers every thread in the process: a panic in another task restores
 /// the terminal while this loop keeps drawing to the plain screen until `q`.
-pub fn run_ui(
-  app: App,
-  decisions: mpsc::Receiver<Decision>,
-  events: mpsc::Receiver<TradeEvent>,
-  status: watch::Receiver<Status>,
-  reloads: mpsc::Receiver<ReloadEvent>,
-  logs: mpsc::Receiver<String>,
-  commands: mpsc::Sender<UiCommand>,
-) -> Result<()> {
-  let inputs = Inputs {
-    decisions,
-    events,
-    status,
-    reloads,
-    logs,
-  };
+pub fn run_ui(app: App, inputs: Inputs, commands: mpsc::Sender<UiCommand>) -> Result<()> {
   let mut terminal = ratatui::try_init()?;
   let result = event_loop(&mut terminal, app, inputs, commands);
   ratatui::restore();
@@ -311,6 +299,7 @@ mod tests {
   #[test]
   fn header_shows_fee_against_cap() {
     let mut app = app();
+    app.phase = Phase::Running;
     app.on_status(Status {
       block: 123,
       next_base_fee: 12 * GWEI,
@@ -334,6 +323,27 @@ mod tests {
     ] {
       assert!(header.contains(part), "missing {part}: {header}");
     }
+  }
+
+  /// Before the first chain is built the header says the bot is connecting, not running,
+  /// though the status channel already holds an empty status; a rebuild says so too.
+  #[test]
+  fn header_shows_connect_and_rebuild() {
+    let mut app = app();
+    app.on_status(Status::default());
+    let text = screen(|frame| draw(frame, &app));
+    let header = text.lines().next().unwrap();
+    assert!(
+      header.contains("connecting to testnet, loading pools"),
+      "{header}"
+    );
+    assert!(!header.contains("running"), "{header}");
+    assert!(!header.contains("block 0"), "{header}");
+    app.phase = Phase::Rebuilding;
+    let text = screen(|frame| draw(frame, &app));
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("rebuilding, loading pools"), "{header}");
+    assert!(!header.contains("running"), "{header}");
   }
 
   /// A trade row shows the quoted and the realised profit side by side.

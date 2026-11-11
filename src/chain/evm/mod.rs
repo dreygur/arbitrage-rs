@@ -245,6 +245,7 @@ impl EvmChain {
         evm.chain_id
       )));
     }
+    info!(network, chain_id, mode = ?cfg.pairs.mode, "node reached, listing pools");
     let signers = signers(&cfg.accounts)?;
     let owner = signers
       .get(cfg.owner)
@@ -259,6 +260,7 @@ impl EvmChain {
     if tracked.is_empty() {
       return Err(Error::Config("no tradable pairs".into()));
     }
+    info!(pools = tracked.len(), "pools listed, checking the executor");
     let operators: Vec<Address> = signers
       .iter()
       .enumerate()
@@ -281,7 +283,13 @@ impl EvmChain {
     )
     .await?;
     let forward_gas = forward_gas(&provider, owner.address(), treasury, evm.max_gas_limit).await?;
+    info!(pools = tracked.len(), "loading pool state and tick windows");
     let state = State::load(&provider, tracked.clone(), &evm, weth).await?;
+    info!(
+      loaded = state.snapshots().len(),
+      pools = tracked.len(),
+      "pool state loaded, starting the feed"
+    );
     let (addresses, v4_ids) = feed_targets(&tracked, &evm);
     let (feed, events) = Feed::spawn(
       ws_url,

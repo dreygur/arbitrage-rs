@@ -13,10 +13,10 @@ use arbitrage::config::{ChainKind, NetworkConfig};
 use arbitrage::error::{Error, Result};
 use arbitrage::redact::{self, Redacting};
 use arbitrage::supervisor::{Links, Supervisor};
-use arbitrage::types::{Status, TradeEvent, Verdict};
+use arbitrage::types::{Phase, Status, TradeEvent, Verdict};
 use arbitrage::ui::app::App;
-use arbitrage::ui::{UiLog, run_ui};
-use tokio::signal::unix::{SignalKind, signal};
+use arbitrage::ui::{Inputs, UiLog, run_ui};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -107,26 +107,18 @@ async fn stop_engine(engine: &Mutex<Option<JoinHandle<()>>>) {
   }
 }
 
-/// Supervises the bot on `network` until it stops: with logs only when `logs` is absent,
-/// under the screen fed by `logs` otherwise. The screen opens once the first chain is
-/// connected and closes when the supervisor is done.
-async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> {
-  let hangup = signal(SignalKind::hangup())?;
-  let path = PathBuf::from(format!("config/{network}.toml"));
-  let cfg = NetworkConfig::load(network)?;
-  let (decisions, decided) = mpsc::channel(DECISIONS);
-  let (reloads, reload_rx) = mpsc::channel(RELOADS);
-  let (commands_tx, commands) = mpsc::channel(COMMANDS);
-  let (status, status_rx) = watch::channel(Status::default());
-  let (trades, trade_rx) = mpsc::channel(TRADES);
-  let screen_trades = logs.is_some().then_some(trades);
-  let links = Links {
-    decisions,
-    commands,
-    reloads,
-    status,
-  };
-  let supervisor = match cfg.kind {
+/// Builds the first chain of `cfg`'s kind and runs the supervisor over it until it stops,
+/// or until the operator quits during that first connect. Trade events go to
+/// `screen_trades` under the screen, and to the log otherwise.
+async fn supervise(
+  network: &str,
+  path: PathBuf,
+  cfg: NetworkConfig,
+  hangup: Signal,
+  links: Links,
+  screen_trades: Option<mpsc::Sender<TradeEvent>>,
+) -> Result<()> {
+  match cfg.kind {
     ChainKind::Evm => {
       let name = network.to_string();
       let engine = Arc::new(Mutex::new(None));
@@ -146,43 +138,74 @@ async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> 
         }
       };
       let env_file = PathBuf::from(ENV_FILE);
-      Supervisor::new(
+      let supervisor =
+        Supervisor::new(network.to_string(), path, env_file, hangup, build, links).await?;
+      match supervisor {
+        Some(supervisor) => supervisor.run().await,
+        None => Ok(()),
+      }
+    }
+  }
+}
+
+/// Supervises the bot on `network` until it stops: with logs only when `logs` is absent,
+/// under the screen fed by `logs` otherwise.
+///
+/// The screen opens before the first connect, which can take minutes, so the operator sees
+/// it progress in the log panel and can quit it. It closes once the supervisor is done,
+/// however that ends, since dropping the command receiver is what tells it to.
+async fn run(network: &str, logs: Option<mpsc::Receiver<String>>) -> Result<()> {
+  let hangup = signal(SignalKind::hangup())?;
+  let path = PathBuf::from(format!("config/{network}.toml"));
+  let cfg = NetworkConfig::load(network)?;
+  let (decisions, decided) = mpsc::channel(DECISIONS);
+  let (reloads, reload_rx) = mpsc::channel(RELOADS);
+  let (commands_tx, commands) = mpsc::channel(COMMANDS);
+  let (status, status_rx) = watch::channel(Status::default());
+  let (phase, phase_rx) = watch::channel(Phase::Connecting);
+  let (trades, trade_rx) = mpsc::channel(TRADES);
+  let screen_trades = logs.is_some().then_some(trades);
+  let links = Links {
+    decisions,
+    commands,
+    reloads,
+    status,
+    phase,
+  };
+  // Held until the run ends in a headless run, since a closed command channel reads as
+  // the screen leaving.
+  let mut headless_commands = None;
+  let screen = match logs {
+    Some(logs) => {
+      let app = App::new(
         network.to_string(),
-        path.clone(),
-        env_file,
-        hangup,
-        build,
-        links,
-      )
-      .await?
+        std::fs::read_to_string(&path)?,
+        cfg.live.limits.executor_max_hold,
+      );
+      let inputs = Inputs {
+        decisions: decided,
+        events: trade_rx,
+        status: status_rx,
+        phase: phase_rx,
+        reloads: reload_rx,
+        logs,
+      };
+      Some(tokio::task::spawn_blocking(move || {
+        run_ui(app, inputs, commands_tx)
+      }))
+    }
+    None => {
+      tokio::spawn(log_decisions(decided));
+      headless_commands = Some(commands_tx);
+      None
     }
   };
-  let Some(logs) = logs else {
-    tokio::spawn(log_decisions(decided));
-    // Held until the run ends, since a closed command channel reads as the screen leaving.
-    let _commands = commands_tx;
-    let supervised = supervisor.run().await;
-    info!("stopped");
+  let supervised = supervise(network, path, cfg, hangup, links, screen_trades).await;
+  drop(headless_commands);
+  info!("stopped");
+  let Some(screen) = screen else {
     return supervised;
   };
-  let app = App::new(
-    network.to_string(),
-    std::fs::read_to_string(&path)?,
-    cfg.live.limits.executor_max_hold,
-  );
-  let screen = tokio::task::spawn_blocking(move || {
-    run_ui(
-      app,
-      decided,
-      trade_rx,
-      status_rx,
-      reload_rx,
-      logs,
-      commands_tx,
-    )
-  });
-  let supervised = supervisor.run().await;
-  info!("stopped");
   let shown = screen
     .await
     .map_err(|e| Error::Io(std::io::Error::other(e)))

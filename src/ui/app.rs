@@ -6,7 +6,9 @@ use ratatui::crossterm::event::KeyCode;
 
 use super::UiCommand;
 use crate::bot::Decision;
-use crate::types::{Amount, EntryKind, Id, ReloadEvent, Status, TradeEvent, TradeState, Verdict};
+use crate::types::{
+  Amount, EntryKind, Id, Phase, ReloadEvent, Status, TradeEvent, TradeState, Verdict,
+};
 
 /// Trade events kept for the trades panel and the detail view; older ones are only in the
 /// journal.
@@ -129,6 +131,8 @@ pub struct App {
   pub trades: VecDeque<TradeEvent>,
   /// Latest chain status, absent until the first one arrives.
   pub status: Option<Status>,
+  /// Whether a chain is being built or runs; the status means nothing while connecting.
+  pub phase: Phase,
   /// Running sums over settled trades.
   pub totals: Totals,
   /// The last [`LOG_LINES`] log lines, oldest first.
@@ -160,6 +164,7 @@ impl App {
       pairs: BTreeMap::new(),
       trades: VecDeque::new(),
       status: None,
+      phase: Phase::Connecting,
       totals: Totals::default(),
       log: VecDeque::new(),
       reload: None,

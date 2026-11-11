@@ -24,7 +24,7 @@ use crate::chain::Chain;
 use crate::config::{Change, NetworkConfig};
 use crate::error::{Error, Result};
 use crate::redact;
-use crate::types::{Control, ReloadEvent, Status};
+use crate::types::{Control, Phase, ReloadEvent, Status};
 use crate::ui::UiCommand;
 
 /// How often the chain's status is copied for the screen.
@@ -57,6 +57,34 @@ async fn forced(commands: &mut mpsc::Receiver<UiCommand>) {
   while let Some(command) = commands.recv().await {
     if command == UiCommand::Quit {
       return;
+    }
+  }
+}
+
+/// Awaits `built`, a chain being built, while still taking the operator's commands, so a
+/// connect or rebuild that takes minutes never traps them. A `q` (or Ctrl+C) or the screen
+/// going away gives the build up and returns `None`. A pause, resume or sweep is held in
+/// `paused` and `sweep_due` for the chain once built; a reload is dropped, since the build
+/// already uses the config just read. Commands are read before the build is polled, so
+/// one the screen already counts as delivered is never lost to a build that finished.
+async fn build_or_quit<C>(
+  built: impl Future<Output = Result<C>>,
+  commands: &mut mpsc::Receiver<UiCommand>,
+  paused: &mut bool,
+  sweep_due: &mut bool,
+) -> Option<Result<C>> {
+  tokio::pin!(built);
+  loop {
+    tokio::select! {
+      biased;
+      command = commands.recv() => match command {
+        Some(UiCommand::Quit) | None => return None,
+        Some(UiCommand::Pause) => *paused = true,
+        Some(UiCommand::Resume) => *paused = false,
+        Some(UiCommand::Sweep) => *sweep_due = true,
+        Some(UiCommand::Reload) => info!("reload ignored while the chain is being built"),
+      },
+      built = built.as_mut() => return Some(built),
     }
   }
 }
@@ -134,6 +162,8 @@ pub struct Links {
   pub reloads: mpsc::Sender<ReloadEvent>,
   /// The latest chain status, for the screen.
   pub status: watch::Sender<Status>,
+  /// Whether a chain is being built or runs, for the screen's header.
+  pub phase: watch::Sender<Phase>,
 }
 
 /// A reread config that needs a restart, held until the restart applies it.
@@ -224,24 +254,48 @@ where
 {
   /// Reads the config at `path` and builds the first chain and its bot. `hangup` is the
   /// `SIGHUP` stream that asks for reloads.
+  ///
+  /// Returns `None` when the operator quit before the chain was built, which the screen
+  /// allows since the first connect can take minutes. A pause or sweep asked for meanwhile
+  /// applies to the new bot.
   pub async fn new(
     network: String,
     path: PathBuf,
     env_file: PathBuf,
     hangup: Signal,
     build: F,
-    links: Links,
-  ) -> Result<Self> {
+    mut links: Links,
+  ) -> Result<Option<Self>> {
     let (cfg, _) = read_config(&path, &network)?;
     let fingerprint = cfg.env_fingerprint();
-    let chain = Arc::new(build(cfg.clone()).await?);
+    let mut paused = false;
+    let mut sweep_due = false;
+    let built = build_or_quit(
+      build(cfg.clone()),
+      &mut links.commands,
+      &mut paused,
+      &mut sweep_due,
+    )
+    .await;
+    let Some(built) = built else {
+      info!("quit before the first chain was built");
+      return Ok(None);
+    };
+    let chain = Arc::new(built?);
     let bot = Arc::new(Bot::new(
       chain.clone(),
       cfg.live.clone(),
       links.decisions.clone(),
     ));
+    if paused {
+      bot.set_paused(true);
+    }
+    if sweep_due {
+      chain.control(Control::Sweep);
+    }
     links.status.send_replace(chain.status());
-    Ok(Self {
+    links.phase.send_replace(Phase::Running);
+    Ok(Some(Self {
       network,
       path,
       env_file,
@@ -251,12 +305,12 @@ where
       pending: None,
       chain,
       bot,
-      paused: false,
+      paused,
       sweep_due: false,
       hangup,
       links,
       future: PhantomData,
-    })
+    }))
   }
 
   /// Sends a reload outcome to the screen. A full or closed channel loses it, since it is
@@ -467,28 +521,50 @@ where
   /// env var only the chain checks, or a node that is down. Then the screen is told, the
   /// running config is built again, and only a failure of that ends the run. The new bot
   /// starts trading unless the operator had paused it, and takes a sweep held meanwhile.
-  async fn restart(mut self) -> Result<Self> {
+  ///
+  /// The screen shows the rebuild while it runs, and a `q` meanwhile gives it up and
+  /// returns `None`; nothing is in flight then, since the old chain was drained.
+  async fn restart(mut self) -> Result<Option<Self>> {
     let pending = self.pending.take();
     drop(self.bot);
     drop(self.chain);
+    self.links.phase.send_replace(Phase::Rebuilding);
     info!("rebuilding the chain");
-    let (chain, cfg, fingerprint, event) = match pending {
-      Some(pending) => match (self.build)(pending.cfg.clone()).await {
-        Ok(chain) => (chain, pending.cfg, pending.fingerprint, Some(pending.event)),
-        Err(_) => {
-          warn!("{BUILD_FAILED}");
-          let event = ReloadEvent {
-            error: Some(BUILD_FAILED.into()),
-            ..ReloadEvent::default()
-          };
-          let chain = (self.build)(self.cfg.clone()).await?;
-          (chain, self.cfg.clone(), self.fingerprint, Some(event))
-        }
-      },
-      None => {
-        let chain = (self.build)(self.cfg.clone()).await?;
-        (chain, self.cfg.clone(), self.fingerprint, None)
+    let first = pending.as_ref().map_or(&self.cfg, |pending| &pending.cfg);
+    let Some(built) = build_or_quit(
+      (self.build)(first.clone()),
+      &mut self.links.commands,
+      &mut self.paused,
+      &mut self.sweep_due,
+    )
+    .await
+    else {
+      info!("quit during the rebuild");
+      return Ok(None);
+    };
+    let (chain, cfg, fingerprint, event) = match (built, pending) {
+      (Ok(chain), Some(pending)) => (chain, pending.cfg, pending.fingerprint, Some(pending.event)),
+      (Ok(chain), None) => (chain, self.cfg.clone(), self.fingerprint, None),
+      (Err(_), Some(_)) => {
+        warn!("{BUILD_FAILED}");
+        let event = ReloadEvent {
+          error: Some(BUILD_FAILED.into()),
+          ..ReloadEvent::default()
+        };
+        let Some(built) = build_or_quit(
+          (self.build)(self.cfg.clone()),
+          &mut self.links.commands,
+          &mut self.paused,
+          &mut self.sweep_due,
+        )
+        .await
+        else {
+          info!("quit during the rebuild");
+          return Ok(None);
+        };
+        (built?, self.cfg.clone(), self.fingerprint, Some(event))
       }
+      (Err(e), None) => return Err(e),
     };
     let chain = Arc::new(chain);
     let bot = Arc::new(Bot::new(
@@ -502,6 +578,8 @@ where
     if self.sweep_due {
       chain.control(Control::Sweep);
     }
+    self.links.status.send_replace(chain.status());
+    self.links.phase.send_replace(Phase::Running);
     info!("restarted");
     let restarted = Self {
       cfg,
@@ -514,7 +592,7 @@ where
     if let Some(event) = event {
       restarted.report(event);
     }
-    Ok(restarted)
+    Ok(Some(restarted))
   }
 
   /// Runs the bot until a quit, the screen going away, or an exit that is not a restart,
@@ -529,7 +607,10 @@ where
       };
       match next {
         Next::Stop => return Ok(()),
-        Next::Restart => self = self.restart().await?,
+        Next::Restart => match self.restart().await? {
+          Some(restarted) => self = restarted,
+          None => return Ok(()),
+        },
       }
     }
   }
@@ -537,10 +618,11 @@ where
 
 #[cfg(test)]
 mod tests {
-  use std::future::{Ready, ready};
+  use std::future::{Pending, Ready, pending, ready};
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicUsize, Ordering};
 
+  use futures::future::Either;
   use tokio::signal::unix::{SignalKind, signal};
 
   use super::*;
@@ -560,6 +642,9 @@ mod tests {
   /// A node URL carrying a key, quoted by a failing mock build.
   const SECRET_URL: &str = "https://node.example/v2/SECRETKEY";
 
+  /// What a mock build returns: a chain or an error at once, or nothing ever.
+  type MockBuild = Either<Ready<Result<MockChain>>, Pending<Result<MockChain>>>;
+
   /// Distinguishes the file sets of tests run in one process.
   static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -578,6 +663,9 @@ mod tests {
     restart_first: bool,
     /// The build attempt, counted from zero, that fails.
     fail_build: Option<usize>,
+    /// The build attempt, counted from zero, that never finishes, like a connect stuck
+    /// loading pools.
+    hang_build: Option<usize>,
   }
 
   impl Shared {
@@ -603,12 +691,22 @@ mod tests {
       status: chain.status.clone(),
       restart_first,
       fail_build,
+      hang_build: None,
+    })
+  }
+
+  /// Fresh shared handles whose build attempt `hang_build` never finishes.
+  fn mock_shared_hanging(hang_build: usize) -> Arc<Shared> {
+    let shared = Arc::into_inner(mock_shared(false, None)).expect("one owner");
+    Arc::new(Shared {
+      hang_build: Some(hang_build),
+      ..shared
     })
   }
 
   /// A builder of mock chains that all report `shared`'s in flight count and status. A
   /// failing build's error quotes a node URL with a key, which must never reach the screen.
-  fn mock_builder(shared: Arc<Shared>) -> impl Fn(NetworkConfig) -> Ready<Result<MockChain>> {
+  fn mock_builder(shared: Arc<Shared>) -> impl Fn(NetworkConfig) -> MockBuild {
     move |cfg| {
       let attempt = {
         let mut configs = shared.configs.lock().unwrap();
@@ -617,8 +715,11 @@ mod tests {
       };
       let mut chain = MockChain::new("base", Vec::new());
       shared.controls.lock().unwrap().push(chain.controls.clone());
+      if shared.hang_build == Some(attempt) {
+        return Either::Right(pending());
+      }
       if shared.fail_build == Some(attempt) {
-        return ready(Err(Error::Rpc(format!("{SECRET_URL} is down"))));
+        return Either::Left(ready(Err(Error::Rpc(format!("{SECRET_URL} is down")))));
       }
       chain.in_flight = shared.in_flight.clone();
       chain.status = shared.status.clone();
@@ -628,7 +729,7 @@ mod tests {
           ..Default::default()
         }));
       }
-      ready(Ok(chain))
+      Either::Left(ready(Ok(chain)))
     }
   }
 
@@ -669,31 +770,45 @@ mod tests {
     commands: mpsc::Sender<UiCommand>,
     /// Receives reload outcomes.
     reloads: mpsc::Receiver<ReloadEvent>,
+    /// The phase the screen would show.
+    phase: watch::Receiver<Phase>,
     /// Keeps the decision channel open.
     _decisions: mpsc::Receiver<Decision>,
   }
 
   /// The supervisor type the tests build.
-  type MockSupervisor<B> = Supervisor<MockChain, B, Ready<Result<MockChain>>>;
+  type MockSupervisor<B> = Supervisor<MockChain, B, MockBuild>;
 
-  /// A supervisor over mock chains sharing `shared`, reading `files`.
-  async fn mock_supervisor(
-    files: &Files,
-    shared: Arc<Shared>,
-  ) -> (
-    MockSupervisor<impl Fn(NetworkConfig) -> Ready<Result<MockChain>>>,
-    Ends,
-  ) {
+  /// Fresh channels for a supervisor whose status starts as `shared`'s, and the test's
+  /// ends of them.
+  fn mock_links(shared: &Shared) -> (Links, Ends) {
     let (decisions, decided) = mpsc::channel(64);
     let (commands_tx, commands) = mpsc::channel(8);
     let (reloads, reload_rx) = mpsc::channel(8);
     let (status, _) = watch::channel(shared.status.lock().unwrap().clone());
+    let (phase, phase_rx) = watch::channel(Phase::Connecting);
     let links = Links {
       decisions,
       commands,
       reloads,
       status,
+      phase,
     };
+    let ends = Ends {
+      commands: commands_tx,
+      reloads: reload_rx,
+      phase: phase_rx,
+      _decisions: decided,
+    };
+    (links, ends)
+  }
+
+  /// A supervisor over mock chains sharing `shared`, reading `files`.
+  async fn mock_supervisor(
+    files: &Files,
+    shared: Arc<Shared>,
+  ) -> (MockSupervisor<impl Fn(NetworkConfig) -> MockBuild>, Ends) {
+    let (links, ends) = mock_links(&shared);
     let supervisor = Supervisor::new(
       NETWORK.into(),
       files.config.clone(),
@@ -703,12 +818,8 @@ mod tests {
       links,
     )
     .await
-    .unwrap();
-    let ends = Ends {
-      commands: commands_tx,
-      reloads: reload_rx,
-      _decisions: decided,
-    };
+    .unwrap()
+    .expect("built");
     (supervisor, ends)
   }
 
@@ -906,6 +1017,82 @@ mod tests {
       ends.commands.send(UiCommand::Quit).await.unwrap();
     };
     let (result, ()) = tokio::join!(supervisor.run(), driver);
+    result.unwrap();
+  }
+
+  /// A `q` during a first connect that never finishes gives it up, so the operator is not
+  /// trapped, and the screen still shows the connect.
+  #[tokio::test(start_paused = true)]
+  async fn quit_during_first_connect() {
+    let files = mock_files(ETHEREUM);
+    let shared = mock_shared_hanging(0);
+    let (links, ends) = mock_links(&shared);
+    ends.commands.send(UiCommand::Pause).await.unwrap();
+    ends.commands.send(UiCommand::Quit).await.unwrap();
+    let built = tokio::time::timeout(
+      SETTLE,
+      Supervisor::new(
+        NETWORK.into(),
+        files.config.clone(),
+        files.env.clone(),
+        signal(SignalKind::hangup()).unwrap(),
+        mock_builder(shared.clone()),
+        links,
+      ),
+    )
+    .await
+    .expect("the quit was not taken");
+    assert!(built.unwrap().is_none());
+    assert_eq!(shared.builds(), 1);
+    assert_eq!(*ends.phase.borrow(), Phase::Connecting);
+  }
+
+  /// A pause sent during the first connect holds for the bot once it is built, and the
+  /// screen is told the chain runs.
+  #[tokio::test(start_paused = true)]
+  async fn pause_during_first_connect_applies() {
+    let files = mock_files(ETHEREUM);
+    let shared = mock_shared(false, None);
+    let (supervisor, ends) = mock_supervisor(&files, shared.clone()).await;
+    assert_eq!(*ends.phase.borrow(), Phase::Running);
+    assert!(!supervisor.paused);
+    let (links, ends) = mock_links(&shared);
+    ends.commands.send(UiCommand::Pause).await.unwrap();
+    let supervisor = Supervisor::new(
+      NETWORK.into(),
+      files.config.clone(),
+      files.env.clone(),
+      signal(SignalKind::hangup()).unwrap(),
+      mock_builder(shared.clone()),
+      links,
+    )
+    .await
+    .unwrap()
+    .expect("built");
+    assert!(supervisor.paused);
+    assert_eq!(shared.controls(1), vec![Control::Pause]);
+  }
+
+  /// A rebuild shows on the screen while it runs, and a `q` meanwhile ends the run
+  /// instead of waiting on a build that never finishes.
+  #[tokio::test(start_paused = true)]
+  async fn quit_during_rebuild() {
+    let files = mock_files(ETHEREUM);
+    let shared = mock_shared_hanging(1);
+    let (supervisor, mut ends) = mock_supervisor(&files, shared.clone()).await;
+    let driver = async {
+      files.edit("gas_v2_v2 = 350000", "gas_v2_v2 = 360000");
+      ends.commands.send(UiCommand::Reload).await.unwrap();
+      while shared.builds() < 2 {
+        tokio::time::sleep(TICK).await;
+      }
+      assert_eq!(*ends.phase.borrow_and_update(), Phase::Rebuilding);
+      ends.commands.send(UiCommand::Quit).await.unwrap();
+    };
+    let (result, ()) =
+      tokio::time::timeout(SETTLE, async { tokio::join!(supervisor.run(), driver) })
+        .await
+        .expect("the quit was not taken");
     result.unwrap();
   }
 
