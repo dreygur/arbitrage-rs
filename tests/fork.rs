@@ -1,8 +1,9 @@
-//! Fork tests of the whole arbitrage loop against a running `make fork`.
+//! Fork tests of the whole arbitrage loop against the pinned anvil `make test-fork` starts.
 //!
-//! Each test runs between an anvil snapshot and its revert, so tests never see each other's
-//! dumps, trades or executors. All are ignored by plain `cargo test`; `make test-fork` runs
-//! them one at a time.
+//! Each test starts from a reset to the pinned block, so tests never see each other's dumps,
+//! trades or executors, while the remote state anvil fetched stays cached. Blocks come only
+//! from transactions and `evm_mine`. All are ignored by plain `cargo test`;
+//! `make test-fork` runs them one at a time.
 
 mod common;
 
@@ -113,7 +114,7 @@ fn v4_against_v2(buy: &Id, sell: &Id) -> bool {
 /// Funding sets every account's ETH, gives it each configured token, and drops the EIP 7702
 /// delegations the accounts and the treasury carry on mainnet.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn fund_credits_eth_and_tokens() {
   forked(|| async {
     let cfg = config();
@@ -141,7 +142,7 @@ async fn fund_credits_eth_and_tokens() {
 
 /// The local V2 quote of one WETH on SushiSwap's WETH/USDC pair equals the router's.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn v2_quote_matches_router() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
@@ -161,7 +162,7 @@ async fn v2_quote_matches_router() {
 /// On the deepest WETH/USDC V4 pool, which charges a protocol fee, the local quotes of one
 /// WETH in and of [`USDC_IN`] in equal the V4Quoter's.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn v4_quote_matches_quoter() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
@@ -202,7 +203,7 @@ async fn v4_quote_matches_quoter() {
 /// A dump on SushiSwap's WETH/USDC pair opens a V4 against V2 trade that executes and grows
 /// the executor's WETH by at least its floor.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn arbitrages_v4_against_sushiswap() {
   forked(|| async {
     let mut ctx = ctx(|_| {}).await;
@@ -229,7 +230,7 @@ async fn arbitrages_v4_against_sushiswap() {
 
 /// A trade front run by the opposite dump at a higher tip reverts with `NoProfit`.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn stale_trade_reverts_no_profit() {
   forked(|| async {
     let mut ctx = ctx(|_| {}).await;
@@ -237,7 +238,7 @@ async fn stale_trade_reverts_no_profit() {
     let amount = tenth_of_weth(&ctx.provider, pair).await;
     let (block, usdc) = dump(&ctx.provider, pair, amount).await;
     let update = catch_up(&ctx, block).await;
-    rpc(&ctx.provider, "evm_setIntervalMining", (0,)).await;
+    rpc(&ctx.provider, "evm_setAutomine", (false,)).await;
     let ops = sent(&step(&ctx, &update).await);
     assert_eq!(ops.len(), 1, "{ops:?}");
     let op = ops[0].clone();
@@ -277,7 +278,7 @@ async fn stale_trade_reverts_no_profit() {
 
 /// Dumps on two pairs give one step two trades, sent from two operators, both executed.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn two_pairs_from_two_accounts() {
   forked(|| async {
     let mut ctx = ctx(|_| {}).await;
@@ -300,7 +301,7 @@ async fn two_pairs_from_two_accounts() {
 /// Right after a trade is accepted, stepping the same touched pools again finds its pools
 /// locked.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn no_retrade_before_own_block_applied() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
@@ -322,11 +323,11 @@ async fn no_retrade_before_own_block_applied() {
 
 /// Without a dump, a step over every pair sends nothing.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn idle_without_imbalance() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
-    let update = catch_up(&ctx, 0).await;
+    let update = advance(&ctx).await;
     let results = ctx.bot.step(update.block, None).await;
     assert!(sent(&results).is_empty(), "{results:?}");
     assert_eq!(ctx.chain.in_flight(), 0);
@@ -342,7 +343,7 @@ async fn idle_without_imbalance() {
 /// 10/11 gwei, below base fee plus tip. The executor is deployed under the normal cap first
 /// and reused by the capped chain, since setup transactions obey the same cap.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn fee_cap_stops_trading() {
   forked(|| async {
     drop(ctx(|_| {}).await);
@@ -369,8 +370,8 @@ async fn fee_cap_stops_trading() {
     );
     let decision = ctx.decisions.try_recv().expect("a decision");
     assert_eq!(decision.verdict, Verdict::GasCap);
-    next_block(&ctx).await;
-    next_block(&ctx).await;
+    advance(&ctx).await;
+    advance(&ctx).await;
     drain(&mut ctx);
     assert!(ctx.seen.is_empty(), "{:#?}", ctx.seen);
     assert_eq!(ctx.chain.in_flight(), 0);
@@ -381,7 +382,7 @@ async fn fee_cap_stops_trading() {
 /// With an executor cap of one wei, the profit of a trade is swept to the treasury in the
 /// blocks after it.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn auto_sweep_above_cap() {
   forked(|| async {
     let mut ctx = ctx(|cfg| {
@@ -413,7 +414,7 @@ async fn auto_sweep_above_cap() {
 
 /// An account that is not an operator cannot execute.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn rejects_non_operator() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
@@ -441,7 +442,7 @@ async fn rejects_non_operator() {
 
 /// An operator cannot sweep, and the owner's sweep pays the treasury.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn sweep_only_pays_treasury() {
   forked(|| async {
     let ctx = ctx(|_| {}).await;
@@ -485,7 +486,7 @@ async fn sweep_only_pays_treasury() {
 /// Discovery over SushiSwap's first [`DISCOVERY_SCAN`] pairs connects and tracks pairs
 /// holding WETH.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn discovers_pairs() {
   forked(|| async {
     let ctx = ctx(|cfg| {
@@ -508,7 +509,7 @@ async fn discovers_pairs() {
 /// A chain connected again after the first is dropped reuses the recorded executor without
 /// deploying.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn executor_reused_after_restart() {
   forked(|| async {
     let first = ctx(|_| {}).await;
@@ -527,7 +528,7 @@ async fn executor_reused_after_restart() {
 /// An executed trade leaves planned, sent and executed lines in the journal, the last with
 /// its gas used and actual profit.
 #[tokio::test]
-#[ignore = "needs a running fork: make fork"]
+#[ignore = "needs the test fork: make test-fork"]
 async fn journal_records_executed_trade() {
   forked(|| async {
     let mut ctx = ctx(|_| {}).await;
