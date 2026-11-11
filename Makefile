@@ -11,6 +11,9 @@ TEST_PORT := 8546
 # serves old blocks' state only for minutes. A failed run leaves no file, so the run after it
 # pins the current head.
 TEST_BLOCK_FILE := target/fork-test-block
+# The block `make fork` is pinned at. A restart forks the same block, so anvil reads remote
+# state from its RPC cache on disk instead of fetching it from FORK_URL again.
+FORK_BLOCK_FILE := target/fork-block
 # Polls of 0.2s the test anvil gets to answer, 120s in all.
 TEST_START_TICKS := 600
 # Where anvil keeps its RPC cache per pinned mainnet block.
@@ -20,7 +23,7 @@ BLOCK_NUMBER := {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}
 -include .env
 export
 
-.PHONY: setup abi test-contracts fork refork fund sweep journal run run-headless test test-fork bench lint teardown
+.PHONY: setup abi test-contracts fork fork-fresh refork fund sweep journal run run-headless test test-fork bench lint teardown
 
 setup:
 	@if [ ! -x "$(FORGE)" ]; then \
@@ -39,8 +42,35 @@ abi:
 test-contracts:
 	@$(FORGE) test --fork-url $(FORK_URL)
 
+# Forks at the block in FORK_BLOCK_FILE, or pins the current head there when the file is
+# missing or anvil holds no RPC cache for its block. Anvil writes that cache when it stops
+# with SIGINT (Ctrl-C), so the next start loads pool state from disk. The block is checked
+# to be plain digits before use, as in test-fork, and FORK_URL is never echoed since it
+# usually holds a key.
+# The retry flags match test-fork's, as a cold load's concurrent reads come in bursts.
 fork:
-	@$(ANVIL) --fork-url $(FORK_URL) --block-time 2
+	@set -e; mkdir -p target; \
+	block=$$(cat $(FORK_BLOCK_FILE) 2>/dev/null || true); \
+	case "$$block" in *[!0-9]*) \
+		rm -f $(FORK_BLOCK_FILE); \
+		echo "$(FORK_BLOCK_FILE) held a bad block number and was removed; rerun to pin the current head" >&2; exit 1 ;; \
+	esac; \
+	if [ -z "$$block" ] || [ ! -d "$(FORK_CACHE)/$$block" ]; then \
+		hex=$$(curl -s -X POST -H 'content-type: application/json' --data '$(BLOCK_NUMBER)' "$(FORK_URL)" \
+			| grep -Eo '"result":"0x[0-9a-fA-F]+"' | grep -Eo '0x[0-9a-fA-F]+' || true); \
+		if [ -z "$$hex" ]; then echo "no block number from FORK_URL" >&2; exit 1; fi; \
+		block=$$(printf '%d' "$$hex"); \
+		case "$$block" in ''|*[!0-9]*) echo "bad block number $$hex from FORK_URL" >&2; exit 1 ;; esac; \
+		echo "$$block" > $(FORK_BLOCK_FILE); \
+	fi; \
+	echo "fork pinned at block $$block; make fork-fresh moves it to the current head"; \
+	exec $(ANVIL) --fork-url "$(FORK_URL)" --fork-block-number "$$block" --block-time 2 \
+		--retries 20 --fork-retry-backoff 2000
+
+# Drops the pinned block, then forks and pins the current head.
+fork-fresh:
+	@rm -f $(FORK_BLOCK_FILE)
+	@$(MAKE) --no-print-directory fork
 
 refork:
 	@curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"anvil_reset","params":[{"forking":{"jsonRpcUrl":"$(FORK_URL)"}}]}' $(RPC_URL)

@@ -59,9 +59,10 @@ Make targets:
 - `make setup` installs Foundry and forge-std.
 - `make abi` builds the contract and copies its ABI to `abi/`.
 - `make test-contracts` runs the forge tests against `FORK_URL`.
-- `make fork` starts anvil as a mainnet fork, one block every 2 seconds.
+- `make fork` starts anvil as a mainnet fork, one block every 2 seconds, pinned at the block in `target/fork-block` so a restart reads state from anvil's cache. Stop it with Ctrl-C so the cache is written.
+- `make fork-fresh` drops that pin and forks the current mainnet head.
 - `make refork` resets the running anvil to the current mainnet head.
-- Neither echoes `FORK_URL`, which usually holds a provider key, but anvil prints its fork URL in its startup banner, so keep that terminal's output private.
+- None of them echoes `FORK_URL`, which usually holds a provider key, but anvil prints its fork URL in its startup banner, so keep that terminal's output private.
 - `make fund` funds the configured accounts with ETH and tokens on the fork.
 - `make sweep` sends the executor's base token profit to the treasury.
 - `make journal` prints the last 20 trade journal entries.
