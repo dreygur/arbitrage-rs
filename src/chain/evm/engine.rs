@@ -18,6 +18,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolEvent, SolValue};
 use alloy::transports::TransportError;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::chain::evm::bindings::{FlashArbitrage, IERC20, IMulticall3, IWETH};
@@ -1342,8 +1343,8 @@ impl<P: Provider> Engine<P> {
         next_base_fee: self.next_base_fee.unwrap_or(0),
         fee_cap: self.cap(),
         max_fee_per_gas: self.evm.max_fee_per_gas,
-        // The engine never sees the feed; `EvmChain::status` fills the lag in.
-        feed_lag_ms: 0,
+        // The engine never sees the feed; `EvmChain::status` fills the head age in.
+        head_age_ms: 0,
         executor: self.executor.to_string(),
         executor_balance: self.executor_balance,
         treasury: self.holdings.treasury().to_string(),
@@ -1376,18 +1377,25 @@ impl<P: Provider> Engine<P> {
   /// Starts the engine task: it reads every lane's nonce and the balances at the latest
   /// block, so the first block's trades are not refused as `LowGas` on balances never read,
   /// then runs commands in order and publishes after each one. The task ends when every
-  /// command sender is dropped.
+  /// command sender is dropped and the queued commands have run; its handle lets a restart
+  /// wait for that before the next engine reads the journal.
   ///
   /// The command channel is unbounded so that a sender never waits and commands from the
   /// bot's synchronous calls (pause, live settings) keep their order; the chain sends a
   /// bounded number per block, so it grows only while the engine is behind.
-  pub fn spawn(mut self) -> (mpsc::UnboundedSender<EngineCmd>, watch::Receiver<Published>)
+  pub fn spawn(
+    mut self,
+  ) -> (
+    mpsc::UnboundedSender<EngineCmd>,
+    watch::Receiver<Published>,
+    JoinHandle<()>,
+  )
   where
     P: 'static,
   {
     let (commands, mut receiver) = mpsc::unbounded_channel();
     let (published, subscriber) = watch::channel(self.snapshot());
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
       self.sync_lanes().await;
       self.read_balances(BlockId::latest()).await;
       published.send_replace(self.snapshot());
@@ -1396,7 +1404,7 @@ impl<P: Provider> Engine<P> {
         published.send_replace(self.snapshot());
       }
     });
-    (commands, subscriber)
+    (commands, subscriber, task)
   }
 }
 
@@ -1611,7 +1619,6 @@ mod tests {
       base_fee: 10 * GWEI,
       gas_used: 15_000_000,
       gas_limit: 30_000_000,
-      timestamp: 0,
       seen: Instant::now(),
       logs: Vec::new(),
       gap: false,
@@ -2022,7 +2029,7 @@ mod tests {
     let f = fixture("published", 2, 16).await;
     let asserter = f.asserter.clone();
     push_balances(&asserter, 2, 2 * ETH);
-    let (commands, mut published) = f.engine.spawn();
+    let (commands, mut published, _task) = f.engine.spawn();
     let first = tokio::time::timeout(
       Duration::from_secs(5),
       published.wait_for(|p| p.status.accounts[1].eth == wei(2 * ETH)),

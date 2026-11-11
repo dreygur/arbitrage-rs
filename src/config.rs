@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer};
 
 use crate::error::{Error, Result};
+use crate::logtime::TimeZone;
 use crate::types::Amount;
 
 /// Env var holding the node HTTP endpoint.
@@ -173,6 +174,9 @@ struct Core {
   /// Optional journal path.
   #[serde(default)]
   journal: PathBuf,
+  /// Optional log time zone text, checked by [`TimeZone`]'s parser.
+  #[serde(default)]
+  time_zone: Option<String>,
   /// Pair selection.
   pairs: PairsConfig,
   /// Adapter table.
@@ -198,6 +202,8 @@ pub struct NetworkConfig {
   pub treasury: String,
   /// Trade journal path; defaults to `logs/trades-<network>.jsonl`.
   pub journal: PathBuf,
+  /// Zone log timestamps are written in; local time when the key is absent.
+  pub time_zone: TimeZone,
   /// Pair selection.
   pub pairs: PairsConfig,
   /// Chain specific settings, parsed by the chain adapter.
@@ -224,6 +230,10 @@ impl NetworkConfig {
     } else {
       core.journal
     };
+    let time_zone = match &core.time_zone {
+      Some(text) => text.parse()?,
+      None => TimeZone::default(),
+    };
     let cfg = Self {
       kind: core.kind,
       base_token: core.base_token,
@@ -233,6 +243,7 @@ impl NetworkConfig {
       owner: core.owner,
       treasury: core.treasury,
       journal,
+      time_zone,
       pairs: core.pairs,
       adapter: core.adapter,
     };
@@ -419,6 +430,18 @@ mod tests {
     )
     .unwrap_err();
     assert!(err.to_string().contains("max_gas_cost"), "{err}");
+  }
+
+  /// A bad time zone is rejected naming the key and value; absent means local.
+  #[test]
+  fn time_zone_key() {
+    let err = edited("time_zone = \"local\"", "time_zone = \"mars\"").unwrap_err();
+    assert_eq!(err.to_string(), "config: time_zone: \"mars\"");
+    let utc = edited("time_zone = \"local\"", "time_zone = \"utc\"").unwrap();
+    assert_eq!(utc.time_zone, TimeZone::Utc);
+    let old = NetworkConfig::parse(ETHEREUM, "ethereum").unwrap();
+    assert_eq!(old.time_zone, TimeZone::Local);
+    assert_eq!(old.diff(1, &utc, 1), Change::Restart);
   }
 
   /// Changing profit thresholds is a live change.

@@ -109,11 +109,13 @@ pub fn protocol_fee(packed: u32, side: Side) -> u32 {
 
 /// The fee in pips the PoolManager charges a swap with `protocol` and `lp` fees:
 /// `protocol + lp - protocol * lp / 1_000_000`, rounded down as Uniswap's
-/// `ProtocolFeeLibrary.calculateSwapFee` does. The protocol fee fits 12 bits and the LP fee
-/// is below a whole, so nothing overflows.
+/// `ProtocolFeeLibrary.calculateSwapFee` does. `protocol` is one direction's 12 bit fee and
+/// `lp` an LP fee below a whole, as [`V4Pool::new`] passes them: the `u64` math cannot
+/// overflow or go below zero, and the result is under two million.
 pub fn swap_fee(protocol: u32, lp: u32) -> u32 {
-  let cut = u64::from(protocol) * u64::from(lp) / u64::from(PIPS);
-  protocol + lp - u32::try_from(cut).unwrap_or(protocol)
+  let (protocol, lp) = (u64::from(protocol), u64::from(lp));
+  let fee = protocol + lp - protocol * lp / u64::from(PIPS);
+  u32::try_from(fee).expect("a 12 bit protocol fee plus an LP fee below a whole fits u32")
 }
 
 /// Id the core sees for `address`: `base_alias` for native, else the address.
@@ -181,7 +183,10 @@ impl V4Pool {
   /// keys the SDK cannot price (unsorted currencies, a non positive tick spacing or a fee
   /// that is not a static LP fee) and for pools where neither currency is native or
   /// `base_alias`.
-  #[allow(clippy::too_many_arguments)]
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate piece of pool state read from the chain"
+  )]
   pub fn new(
     venue: String,
     pool: Id,

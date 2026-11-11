@@ -484,6 +484,7 @@ pub(crate) mod tests {
   use alloy::sol_types::SolCall;
   use uniswap_v3_sdk::prelude::{TickIndex, get_sqrt_ratio_at_tick};
 
+  use crate::chain::evm::multicall::chunk_size;
   use crate::chain::evm::venue::v4::V4Key;
   use crate::testkit::{mock_evm_config, mock_provider, push_multicall};
   use crate::types::Side;
@@ -492,6 +493,8 @@ pub(crate) mod tests {
   pub(crate) const L: u128 = 10_000_000_000;
   /// Block the test state is loaded at.
   const LOADED: u64 = 10;
+  /// V4 pools in the many pool loads: enough that every batch splits into several chunks.
+  const MANY: usize = 24;
   /// A tick within one word of the upper edge of the window loaded around tick zero.
   pub(crate) const NEAR_UPPER: i32 = 16_000;
   /// Answers of a load where every pool reads cleanly at block 10.
@@ -568,6 +571,20 @@ pub(crate) mod tests {
     get_sqrt_ratio_at_tick(tick.to_i24()).unwrap()
   }
 
+  /// A `getTickBitmap` answer with only `bit` set, or an empty word for `None`.
+  fn bitmap(bit: Option<usize>) -> Vec<u8> {
+    let word = bit.map_or(U256::ZERO, |bit| U256::from(1u8) << bit);
+    IStateView::getTickBitmapCall::abi_encode_returns(&word)
+  }
+
+  /// A `getTickLiquidity` answer of gross liquidity `gross` and net change `net`.
+  fn tick_info(gross: u128, net: i128) -> Vec<u8> {
+    IStateView::getTickLiquidityCall::abi_encode_returns(&IStateView::getTickLiquidityReturn {
+      liquidityGross: gross,
+      liquidityNet: net,
+    })
+  }
+
   /// Queues the answers a load reads, shaped by `answers`: block number, the pool batch, and
   /// the tick window batches (one position over -600..600).
   pub(crate) fn push_load(asserter: &Asserter, answers: Answers) {
@@ -595,31 +612,102 @@ pub(crate) mod tests {
         Some(IERC20::decimalsCall::abi_encode_returns(&18u8)),
       ],
     );
-    let bitmap =
-      |bit: usize| IStateView::getTickBitmapCall::abi_encode_returns(&(U256::from(1u8) << bit));
     push_multicall(
       asserter,
       vec![
-        answers.bitmaps.then(|| bitmap(246)),
-        Some(bitmap(10)),
-        Some(IStateView::getTickBitmapCall::abi_encode_returns(
-          &U256::ZERO,
-        )),
+        answers.bitmaps.then(|| bitmap(Some(246))),
+        Some(bitmap(Some(10))),
+        Some(bitmap(None)),
       ],
     );
     if !answers.bitmaps {
       return;
     }
-    let tick = |net: i128| {
-      IStateView::getTickLiquidityCall::abi_encode_returns(&IStateView::getTickLiquidityReturn {
-        liquidityGross: L,
-        liquidityNet: net,
-      })
-    };
     push_multicall(
       asserter,
-      vec![Some(tick(L as i128)), Some(tick(-(L as i128)))],
+      vec![
+        Some(tick_info(L, L as i128)),
+        Some(tick_info(L, -(L as i128))),
+      ],
     );
+  }
+
+  /// Key of the `i`th pool of the many pool loads, told apart from the others by its fee.
+  fn many_key(i: usize) -> V4Key {
+    V4Key {
+      fee: 100 * (i as u32 + 1),
+      ..key()
+    }
+  }
+
+  /// The pool, bitmap and tick batch answers of a load of the many pools `pools`. Each pool
+  /// holds one position over -600..600 with a liquidity of its own, so an answer handed to the
+  /// wrong pool shows in its state.
+  fn many_answers(pools: &[usize]) -> [Vec<Option<Vec<u8>>>; 3] {
+    let [mut heads, mut bitmaps, mut ticks] = [Vec::new(), Vec::new(), Vec::new()];
+    for &i in pools {
+      let liquidity = L + i as u128;
+      let slot0 = IStateView::getSlot0Return {
+        sqrtPriceX96: price_at(0),
+        tick: I24::ZERO,
+        protocolFee: U24::ZERO,
+        lpFee: U24::from(many_key(i).fee),
+      };
+      heads.extend([
+        Some(IStateView::getSlot0Call::abi_encode_returns(&slot0)),
+        Some(IStateView::getLiquidityCall::abi_encode_returns(&liquidity)),
+        Some(IERC20::decimalsCall::abi_encode_returns(&18u8)),
+      ]);
+      bitmaps.extend([
+        Some(bitmap(Some(246))),
+        Some(bitmap(Some(10))),
+        Some(bitmap(None)),
+      ]);
+      let net = liquidity as i128;
+      ticks.extend([
+        Some(tick_info(liquidity, net)),
+        Some(tick_info(liquidity, -net)),
+      ]);
+    }
+    [heads, bitmaps, ticks]
+  }
+
+  /// Queues one batch's answers as the node returns them: one `aggregate3` per chunk.
+  fn push_chunked(asserter: &Asserter, answers: &[Option<Vec<u8>>]) {
+    for chunk in answers.chunks(chunk_size(answers.len())) {
+      push_multicall(asserter, chunk.to_vec());
+    }
+  }
+
+  /// The many pools `pools` as discovery would return them.
+  fn many_tracked(pools: &[usize]) -> Vec<Tracked> {
+    pools
+      .iter()
+      .map(|&i| Tracked::V4 {
+        venue: 1,
+        key: many_key(i),
+      })
+      .collect()
+  }
+
+  /// State of the many pools `pools` loaded at block 10 through `mock_provider`, checking
+  /// every chunk's answer was read.
+  async fn load_many(pools: &[usize]) -> State {
+    let asserter = Asserter::new();
+    asserter.push_success(&U64::from(LOADED));
+    for batch in many_answers(pools) {
+      push_chunked(&asserter, &batch);
+    }
+    let state = State::load(
+      &mock_provider(&asserter),
+      many_tracked(pools),
+      &mock_evm_config(),
+      weth(),
+    )
+    .await
+    .unwrap();
+    assert!(asserter.read_q().is_empty(), "load left answers unread");
+    state
   }
 
   /// State loaded through `mock_provider` from `answers`, checking every answer was read.
@@ -651,7 +739,6 @@ pub(crate) mod tests {
       base_fee: 0,
       gas_used: 0,
       gas_limit: 0,
-      timestamp: 0,
       seen: std::time::Instant::now(),
       logs: logs.to_vec(),
       gap: false,
@@ -899,7 +986,6 @@ pub(crate) mod tests {
       base_fee: 0,
       gas_used: 0,
       gas_limit: 0,
-      timestamp: 0,
       seen: std::time::Instant::now(),
       logs: vec![sync(5, 7, 0)],
       gap: true,
@@ -965,5 +1051,60 @@ pub(crate) mod tests {
     let left = described(&state);
     assert_eq!(left.len(), 1);
     assert!(left[0].starts_with("uniswap_v4 "), "{left:?}");
+  }
+
+  /// Batches split into chunks sent concurrently load the same state as loading each pool on
+  /// its own, where every batch is one request: the same pools in the same order, with the
+  /// same prices, liquidity and quotes.
+  #[tokio::test]
+  async fn chunked_load_matches_single_requests() {
+    let all: Vec<usize> = (0..MANY).collect();
+    for batch in many_answers(&all) {
+      assert!(
+        batch.len() > 2 * chunk_size(batch.len()),
+        "batch fits too few chunks"
+      );
+    }
+    let together = load_many(&all).await.snapshots();
+    let mut alone = Vec::new();
+    for &i in &all {
+      alone.extend(load_many(&[i]).await.snapshots());
+    }
+    let summary = |pools: &[Arc<dyn Venue>]| -> Vec<(String, Amount, Amount)> {
+      let amount = Amount::from(1_000_000u64);
+      pools
+        .iter()
+        .map(|pool| {
+          (
+            pool.describe(),
+            pool.quote_out(amount, Side::ZeroForOne).unwrap(),
+            pool.quote_out(amount, Side::OneForZero).unwrap(),
+          )
+        })
+        .collect()
+    };
+    assert_eq!(together.len(), MANY);
+    assert_eq!(summary(&together), summary(&alone));
+  }
+
+  /// A failed request for one chunk of the tick batch fails the whole load.
+  #[tokio::test]
+  async fn failed_chunk_fails_load() {
+    let all: Vec<usize> = (0..MANY).collect();
+    let [heads, bitmaps, ticks] = many_answers(&all);
+    let asserter = Asserter::new();
+    asserter.push_success(&U64::from(LOADED));
+    push_chunked(&asserter, &heads);
+    push_chunked(&asserter, &bitmaps);
+    push_multicall(&asserter, ticks[..chunk_size(ticks.len())].to_vec());
+    asserter.push_failure_msg("upstream reset");
+    let loaded = State::load(
+      &mock_provider(&asserter),
+      many_tracked(&all),
+      &mock_evm_config(),
+      weth(),
+    )
+    .await;
+    assert!(loaded.is_err());
   }
 }

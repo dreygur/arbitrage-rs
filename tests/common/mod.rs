@@ -1,7 +1,9 @@
-//! Shared harness for the fork tests: env setup, a funded and connected bot, chain snapshots,
-//! pool dumps that open an arbitrage, and waits on blocks and trade events.
+//! Shared harness for the fork tests: env setup, a funded and connected bot, a reset of the
+//! fork before each test, pool dumps that open an arbitrage, and blocks mined on demand.
 //!
-//! Every helper talks to the anvil fork `make fork` starts at `127.0.0.1:8545`.
+//! Every helper talks to the anvil `make test-fork` starts at `127.0.0.1:8546`: pinned to one
+//! fork block and mining only when a transaction arrives or a test calls `evm_mine`, so no
+//! test waits on a block timer.
 
 #![allow(
   dead_code,
@@ -9,7 +11,6 @@
 )]
 
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,7 +20,6 @@ use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
-use futures::FutureExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -37,10 +37,11 @@ use arbitrage::venue::Venue;
 
 /// The anvil test mnemonic, whose accounts the shipped config names.
 pub const ANVIL_MNEMONIC: &str = "test test test test test test test test test test test junk";
-/// Node HTTP endpoint, the `.env.example` default.
-pub const RPC_URL: &str = "http://127.0.0.1:8545";
-/// Node WebSocket endpoint, the `.env.example` default.
-pub const WS_URL: &str = "ws://127.0.0.1:8545";
+/// HTTP endpoint of the test anvil, on the `TEST_PORT` the Makefile starts it on, apart from
+/// the `make fork` node on 8545.
+pub const RPC_URL: &str = "http://127.0.0.1:8546";
+/// WebSocket endpoint of the test anvil.
+pub const WS_URL: &str = "ws://127.0.0.1:8546";
 /// Upstream the fork follows, the `.env.example` default, used only when `FORK_URL` is unset.
 pub const FORK_URL: &str = "https://ethereum-rpc.publicnode.com";
 /// Config file the tests load, `config/ethereum.toml`.
@@ -66,9 +67,13 @@ pub const ROUTER: Address = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 pub const QUOTER: Address = address!("52F0E24D1c21C8A0cB1e5a5dD6198556BD9E1203");
 /// One ether in wei.
 pub const ETHER: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
-/// Seconds between blocks the fork mines, as `make fork` starts it.
-pub const BLOCK_TIME: u64 = 2;
-/// Longest wait for one block or one receipt.
+/// How long a freshly mined block gets to come through the feed before another is mined.
+pub const FEED_WAIT: Duration = Duration::from_secs(5);
+/// Seconds between the timestamps of blocks the test fork mines, fixed so they repeat run to
+/// run.
+pub const BLOCK_SPACING: u64 = 1;
+/// Longest wait for one block or one receipt, a safety net only: blocks are mined on demand,
+/// so a wait this long means something hung.
 pub const WAIT: Duration = Duration::from_secs(60);
 /// Blocks to follow a trade or a transfer before giving up.
 pub const BLOCKS: usize = 10;
@@ -120,7 +125,7 @@ pub async fn provider() -> DynProvider {
   ProviderBuilder::new()
     .connect(RPC_URL)
     .await
-    .expect("fork not reachable, run make fork")
+    .expect("test fork not reachable, run make test-fork")
     .erased()
 }
 
@@ -135,36 +140,44 @@ where
     .unwrap_or_else(|e| panic!("{method}: {e}"))
 }
 
-/// Takes an anvil snapshot of the whole chain.
-pub async fn snapshot() -> U256 {
-  let provider = provider().await;
-  let id = rpc(&provider, "evm_snapshot", ()).await;
-  serde_json::from_value(id).expect("snapshot id")
+/// Resets the test anvil to the block it was pinned at, dropping every change a test made,
+/// turns automine back on, which a test may have stopped, and spaces new blocks exactly one
+/// second apart.
+///
+/// A reset, unlike `evm_revert`, keeps the remote state anvil already fetched: the old fork
+/// backend writes its cache to disk and the new one reads it back, while a revert discards
+/// everything fetched after its snapshot. The fork URL must be the one anvil was started
+/// with, since that cache is kept per endpoint. Fixed block spacing makes every mined block's
+/// timestamp, and so the beacon roots slot its system call writes, the same in every run,
+/// which a later run then finds in the disk cache instead of asking the public node for
+/// state it may no longer serve.
+pub async fn reset(provider: &DynProvider) {
+  let info = rpc(provider, "anvil_nodeInfo", ()).await;
+  let block = info["forkConfig"]["forkBlockNumber"]
+    .as_u64()
+    .expect("test fork is not pinned to a block");
+  let url = std::env::var("FORK_URL").expect("FORK_URL");
+  let forking = json!({ "forking": { "jsonRpcUrl": url, "blockNumber": block } });
+  rpc(provider, "anvil_reset", (forking,)).await;
+  rpc(provider, "evm_setAutomine", (true,)).await;
+  rpc(
+    provider,
+    "anvil_setBlockTimestampInterval",
+    (BLOCK_SPACING,),
+  )
+  .await;
 }
 
-/// Rewinds the chain to snapshot `id` and puts back the fork's interval mining, which a test
-/// may have stopped.
-pub async fn revert(id: U256) {
-  let provider = provider().await;
-  let reverted = rpc(&provider, "evm_revert", (id,)).await;
-  assert_eq!(reverted, Value::Bool(true), "snapshot {id} not reverted");
-  rpc(&provider, "evm_setIntervalMining", (BLOCK_TIME,)).await;
-}
-
-/// Runs `body` between a snapshot and its revert, reverting even when it panics, then lets
-/// the panic go on.
+/// Runs `body` on the test fork reset to its pinned block, so no test sees another's dumps,
+/// trades or executors. A test that panics needs no cleanup, since the next one resets.
 pub async fn forked<F, Fut>(body: F)
 where
   F: FnOnce() -> Fut,
   Fut: Future<Output = ()>,
 {
   setup();
-  let id = snapshot().await;
-  let outcome = AssertUnwindSafe(body()).catch_unwind().await;
-  revert(id).await;
-  if let Err(panic) = outcome {
-    std::panic::resume_unwind(panic);
-  }
+  reset(&provider().await).await;
+  body().await;
 }
 
 /// The shipped ethereum config.
@@ -187,7 +200,7 @@ pub fn treasury(cfg: &NetworkConfig) -> Address {
 }
 
 /// A journal path no earlier context used.
-fn journal_path() -> std::path::PathBuf {
+pub fn journal_path() -> std::path::PathBuf {
   let nanos = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .map_or(0, |d| d.as_nanos());
@@ -216,9 +229,85 @@ pub struct Ctx {
   pub decisions: mpsc::Receiver<Decision>,
 }
 
+/// Waits until the engine has taken the head of `block`, so its fee and locks are current
+/// when the bot steps.
+async fn engine_took(ctx: &Ctx, block: u64) {
+  let deadline = Instant::now() + WAIT;
+  while ctx.chain.status().block < block {
+    assert!(Instant::now() < deadline, "engine never took block {block}");
+    tokio::time::sleep(POLL).await;
+  }
+}
+
+/// Folds `update` into `merged`: its touched pools, its block, and any reload or restart.
+fn merge(merged: &mut Update, update: Update) {
+  merged.touched.extend(update.touched);
+  merged.reload |= update.reload;
+  merged.restart |= update.restart;
+  merged.block = update.block;
+}
+
+/// Takes the next change the chain has queued and waits until the engine has taken its
+/// head. The change must already be mined; the timeout is a safety net.
+pub async fn next_change(ctx: &Ctx) -> Update {
+  let update = tokio::time::timeout(WAIT, ctx.chain.changes())
+    .await
+    .expect("no block from the fork")
+    .expect("changes");
+  engine_took(ctx, update.block).await;
+  update
+}
+
+/// Pulls changes until the chain has applied the already mined `block`, at least one, and
+/// returns them merged: every touched pool, the last block, and whether any asked for a
+/// reload or restart.
+pub async fn catch_up(ctx: &Ctx, block: u64) -> Update {
+  let mut merged = Update::default();
+  loop {
+    merge(&mut merged, next_change(ctx).await);
+    if merged.block >= block {
+      return merged;
+    }
+  }
+}
+
+/// Mines empty blocks with `evm_mine`, one every [`FEED_WAIT`], until the chain delivers a
+/// change, then catches up to the last block mined. The engine also runs the maintenance
+/// held back for the block before.
+///
+/// The feed subscribes to heads in its own task, so right after a connect a mined block can
+/// come before the subscription and never be delivered; the next one then arrives. Only the
+/// re-mining is on a timer: `changes` runs to completion, never dropped halfway through
+/// applying a block, and [`WAIT`] cancels it only when no block ever arrives.
+pub async fn advance(ctx: &Ctx) -> Update {
+  rpc(&ctx.provider, "evm_mine", ()).await;
+  let remine = async {
+    loop {
+      tokio::time::sleep(FEED_WAIT).await;
+      rpc(&ctx.provider, "evm_mine", ()).await;
+    }
+  };
+  let first = tokio::select! {
+    first = tokio::time::timeout(WAIT, ctx.chain.changes()) => {
+      first.expect("the feed delivered no block").expect("changes")
+    }
+    () = remine => unreachable!("re-mining never ends"),
+  };
+  engine_took(ctx, first.block).await;
+  let mined = ctx.provider.get_block_number().await.expect("block number");
+  let block = first.block;
+  let mut merged = Update::default();
+  merge(&mut merged, first);
+  if block < mined {
+    merge(&mut merged, catch_up(ctx, mined).await);
+  }
+  merged
+}
+
 /// Loads the shipped config with a fresh journal under `target/test-journals/`, applies
-/// `overrides`, funds the accounts and the dumper (dropping their EIP 7702 delegations), and
-/// connects the chain and a bot over it.
+/// `overrides`, funds the accounts and the dumper (dropping their EIP 7702 delegations),
+/// connects the chain and a bot over it, and mines until the feed delivers a block, so the
+/// feed is live and the engine has a head and a fee before the test starts.
 pub async fn ctx(overrides: impl Fn(&mut NetworkConfig)) -> Ctx {
   setup();
   let mut cfg = config();
@@ -238,7 +327,7 @@ pub async fn ctx(overrides: impl Fn(&mut NetworkConfig)) -> Ctx {
   let chain = Arc::new(chain);
   let (decisions_tx, decisions) = mpsc::channel(DECISIONS);
   let bot = Bot::new(chain.clone(), cfg.live.clone(), decisions_tx);
-  Ctx {
+  let ctx = Ctx {
     cfg,
     chain,
     bot,
@@ -246,7 +335,9 @@ pub async fn ctx(overrides: impl Fn(&mut NetworkConfig)) -> Ctx {
     events,
     seen: Vec::new(),
     decisions,
-  }
+  };
+  advance(&ctx).await;
+  ctx
 }
 
 /// The executor the chain trades through.
@@ -408,41 +499,6 @@ pub async fn dump(provider: &DynProvider, pair: Address, weth_amount: U256) -> (
   (block, out)
 }
 
-/// Waits for the next change, then until the engine has taken its head, so its fee and locks
-/// are current when the bot steps.
-pub async fn next_block(ctx: &Ctx) -> Update {
-  let update = tokio::time::timeout(WAIT, ctx.chain.changes())
-    .await
-    .expect("no block from the fork")
-    .expect("changes");
-  let deadline = Instant::now() + WAIT;
-  while ctx.chain.status().block < update.block {
-    assert!(
-      Instant::now() < deadline,
-      "engine never took block {}",
-      update.block
-    );
-    tokio::time::sleep(POLL).await;
-  }
-  update
-}
-
-/// Pulls changes until the chain has applied `block`, at least one, and returns them merged:
-/// every touched pool, the last block, and whether any asked for a reload or restart.
-pub async fn catch_up(ctx: &Ctx, block: u64) -> Update {
-  let mut merged = Update::default();
-  loop {
-    let update = next_block(ctx).await;
-    merged.touched.extend(update.touched);
-    merged.reload |= update.reload;
-    merged.restart |= update.restart;
-    merged.block = update.block;
-    if merged.block >= block {
-      return merged;
-    }
-  }
-}
-
 /// Dumps a tenth of their WETH into each of `pairs` and catches up past the dumps.
 pub async fn imbalance(ctx: &Ctx, pairs: &[Address]) -> Update {
   let mut last = 0;
@@ -475,7 +531,7 @@ pub fn drain(ctx: &mut Ctx) {
   }
 }
 
-/// The first event seen that satisfies `done`, pulling up to `blocks` blocks for it.
+/// The first event seen that satisfies `done`, mining up to `blocks` blocks for it.
 pub async fn await_event(
   ctx: &mut Ctx,
   blocks: usize,
@@ -486,7 +542,7 @@ pub async fn await_event(
     if let Some(event) = ctx.seen.iter().find(|event| done(event)) {
       return event.clone();
     }
-    next_block(ctx).await;
+    advance(ctx).await;
   }
   panic!(
     "no matching event within {blocks} blocks; seen {:#?}",

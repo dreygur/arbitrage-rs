@@ -25,15 +25,16 @@ pub mod venue;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, TxKind, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::chain::Chain;
@@ -81,15 +82,6 @@ pub fn parse_address(key: &str, text: &str) -> Result<Address> {
 /// Locks `mutex`, recovering the value if a holder panicked.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
   mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Milliseconds `now` is past the block `timestamp` (Unix seconds), zero for a block stamped
-/// in the future.
-fn lag_ms(timestamp: u64, now: SystemTime) -> u64 {
-  let now_ms = now
-    .duration_since(UNIX_EPOCH)
-    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-  now_ms.saturating_sub(timestamp.saturating_mul(1000))
 }
 
 /// The first ledger id this run may use: one past the highest id in the journal at `path`,
@@ -209,14 +201,15 @@ pub struct EvmChain {
   feed: FeedHandle,
   /// Commands to the engine task, in the order they must run.
   commands: mpsc::UnboundedSender<EngineCmd>,
+  /// The engine task, until [`EvmChain::take_engine`] hands it out.
+  engine: Mutex<Option<JoinHandle<()>>>,
   /// Set when a head went to the engine and its maintenance has not: it follows the next
   /// submit, or goes at the start of the next `changes` when the bot submitted nothing.
   maintenance_due: AtomicBool,
   /// What the engine published last.
   published: watch::Receiver<Published>,
-  /// How far the last block read lagged its timestamp.
-  feed_lag_ms: AtomicU64,
-  /// When the last block was seen by the feed and read by the bot.
+  /// When the last block was seen by the feed and read by the bot; the first is what the
+  /// header's head age counts from.
   last_block: Mutex<Option<(Instant, Instant)>>,
 }
 
@@ -242,6 +235,7 @@ impl EvmChain {
         evm.chain_id
       )));
     }
+    info!(network, chain_id, mode = ?cfg.pairs.mode, "node reached, listing pools");
     let signers = signers(&cfg.accounts)?;
     let owner = signers
       .get(cfg.owner)
@@ -256,6 +250,7 @@ impl EvmChain {
     if tracked.is_empty() {
       return Err(Error::Config("no tradable pairs".into()));
     }
+    info!(pools = tracked.len(), "pools listed, checking the executor");
     let operators: Vec<Address> = signers
       .iter()
       .enumerate()
@@ -278,7 +273,13 @@ impl EvmChain {
     )
     .await?;
     let forward_gas = forward_gas(&provider, owner.address(), treasury, evm.max_gas_limit).await?;
+    info!(pools = tracked.len(), "loading pool state and tick windows");
     let state = State::load(&provider, tracked.clone(), &evm, weth).await?;
+    info!(
+      loaded = state.snapshots().len(),
+      pools = tracked.len(),
+      "pool state loaded, starting the feed"
+    );
     let (addresses, v4_ids) = feed_targets(&tracked, &evm);
     let (feed, events) = Feed::spawn(
       ws_url,
@@ -308,7 +309,7 @@ impl EvmChain {
       first_id,
     )
     .with_forward_gas(forward_gas);
-    let (commands, published) = engine.spawn();
+    let (commands, published, engine_task) = engine.spawn();
     let base = to_id(weth);
     let snapshots = state.snapshots();
     let pairs: HashSet<&Id> = snapshots
@@ -339,12 +340,19 @@ impl EvmChain {
       snapshots: RwLock::new(snapshots),
       feed,
       commands,
+      engine: Mutex::new(Some(engine_task)),
       maintenance_due: AtomicBool::new(false),
       published,
-      feed_lag_ms: AtomicU64::new(0),
       last_block: Mutex::new(None),
     };
     Ok((chain, trades))
+  }
+
+  /// Hands out the engine task once. The task ends after this chain is dropped and the
+  /// commands already queued have run, so a restart that awaits it before connecting
+  /// again never has two engines planning ledger ids from the same journal.
+  pub fn take_engine(&self) -> Option<JoinHandle<()>> {
+    self.engine.lock().unwrap_or_else(|e| e.into_inner()).take()
   }
 
   /// Queues `command` for the engine, behind every command sent before it.
@@ -366,24 +374,21 @@ impl EvmChain {
     *self.snapshots.write().unwrap_or_else(|e| e.into_inner()) = state.snapshots();
   }
 
-  /// Applies `block` to `state`: a change that cannot be trusted reloads every pool. A feed
-  /// gap first checks that the executor still has code; when it is gone the chain asks for a
-  /// restart and skips the reload, since the chain is about to be rebuilt and rereading every
-  /// pool of a reset fork is the slow part. Pools near their tick window's edge get a
-  /// refetch, then the engine gets the head, which it handles without RPC; its maintenance is
-  /// held back until after the submit.
+  /// Applies `block` to `state`: a change that cannot be trusted reloads every pool. Every
+  /// reload first checks that the executor still has code, whether a feed gap or a skipped
+  /// block asked for it, since a fork reset before the feed's first head shows up only as a
+  /// skip. When the code is gone the chain asks for a restart and skips the reload, since the
+  /// chain is about to be rebuilt and rereading every pool of a reset fork is the slow part.
+  /// Pools near their tick window's edge get a refetch, then the engine gets the head, which
+  /// it handles without RPC; its maintenance is held back until after the submit.
   ///
   /// The block counts as read once state reflects it, so a reload's time is in the read
   /// stage of a trade's latency rather than in the decision.
   async fn on_block(&self, state: &mut State, block: FeedBlock) -> Result<Update> {
-    self.feed_lag_ms.store(
-      lag_ms(block.timestamp, SystemTime::now()),
-      Ordering::Relaxed,
-    );
     let mut update = state.apply(&block);
     if update.reload {
-      if block.gap && !has_code(&self.provider, self.executor).await {
-        warn!(executor = %self.executor, "executor has no code after a feed gap, restarting");
+      if !has_code(&self.provider, self.executor).await {
+        warn!(executor = %self.executor, "executor has no code before a reload, restarting");
         update.restart = true;
       } else {
         reload(&self.provider, state).await;
@@ -505,10 +510,14 @@ impl Chain for EvmChain {
     self.base.clone()
   }
 
-  /// The engine's status with the feed lag filled in.
+  /// The engine's status with the head age filled in: the time since the feed saw the
+  /// last head, measured now, so a stalled feed shows as a growing number. A block's
+  /// timestamp is not used, since anvil's fork clock runs at a fixed offset from it.
   fn status(&self) -> Status {
     let mut status = self.published.borrow().status.clone();
-    status.feed_lag_ms = self.feed_lag_ms.load(Ordering::Relaxed);
+    status.head_age_ms = lock(&self.last_block).map_or(0, |(seen, _)| {
+      u64::try_from(seen.elapsed().as_millis()).unwrap_or(u64::MAX)
+    });
     status
   }
 }
@@ -552,7 +561,7 @@ mod tests {
         next_base_fee: 0,
         fee_cap: 0,
         max_fee_per_gas: 0,
-        feed_lag_ms: 0,
+        head_age_ms: 0,
         executor: executor().to_string(),
         executor_balance: Amount::ZERO,
         treasury: String::new(),
@@ -614,9 +623,9 @@ mod tests {
       snapshots: RwLock::new(Vec::new()),
       feed: FeedHandle::detached(),
       commands: commands_tx,
+      engine: Mutex::new(None),
       maintenance_due: AtomicBool::new(false),
       published: published_rx,
-      feed_lag_ms: AtomicU64::new(0),
       last_block: Mutex::new(None),
     };
     Harness {
@@ -657,7 +666,6 @@ mod tests {
       base_fee: 0,
       gas_used: 0,
       gas_limit: 0,
-      timestamp: 0,
       seen: Instant::now(),
       logs: Vec::new(),
       gap,
@@ -693,7 +701,6 @@ mod tests {
     assert!(update.reload && update.restart, "{update:?}");
     assert_eq!(h.asserter.read_q().len(), 1, "a pool reload ran");
     assert_eq!(applied(&mut h.commands), 12);
-    assert!(h.chain.status().feed_lag_ms > 0);
   }
 
   /// After a gap an executor that still has code keeps the chain running, its code read
@@ -727,6 +734,25 @@ mod tests {
     assert!(!update.reload && !update.restart);
     assert_eq!(update.block, LOADED + 1);
     assert_eq!(applied(&mut h.commands), LOADED + 1);
+  }
+
+  /// The head age counts from when the feed saw the last head, not from its timestamp,
+  /// and is measured when the status is read, so it keeps growing while the feed stalls.
+  #[tokio::test]
+  async fn head_age_counts_from_seen() {
+    let h = harness(HashMap::new()).await;
+    assert_eq!(h.chain.status().head_age_ms, 0);
+    let seen = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+    let head = FeedBlock {
+      seen,
+      ..block(LOADED + 1, false)
+    };
+    h.feed.send(FeedEvent::Block(head)).await.unwrap();
+    h.chain.changes().await.unwrap();
+    let first = h.chain.status().head_age_ms;
+    assert!((2_000..60_000).contains(&first), "{first}");
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(h.chain.status().head_age_ms >= first + 20);
   }
 
   /// A tick window yields an empty update at the current block and tells the engine nothing.
@@ -865,11 +891,13 @@ mod tests {
     assert_eq!(sent(&mut h.commands), vec!["head", "maintain", "head"]);
   }
 
-  /// A reload without a gap, from a skipped block, rereads the pools but never the
-  /// executor's code.
+  /// A reload without a gap, from a skipped block, checks the executor's code too: with
+  /// code it rereads the pools, and without it asks for a restart and leaves the reload's
+  /// block number read unread. A fork reset before the feed's first head shows up this way.
   #[tokio::test(start_paused = true)]
-  async fn reload_without_gap_skips_code_read() {
+  async fn reload_without_gap_checks_code() {
     let mut h = harness(HashMap::new()).await;
+    h.asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
     h.asserter.push_success(&U64::from(LOADED + 2));
     h.feed
       .send(FeedEvent::Block(block(LOADED + 2, false)))
@@ -877,11 +905,23 @@ mod tests {
       .unwrap();
     let update = tokio::time::timeout(Duration::from_secs(5), h.chain.changes())
       .await
-      .expect("changes waited on a code read")
+      .expect("changes hung on a misordered read")
       .unwrap();
     assert!(update.reload && !update.restart, "{update:?}");
     assert!(h.asserter.read_q().is_empty());
     assert_eq!(applied(&mut h.commands), LOADED + 2);
+    h.asserter.push_success(&Bytes::new());
+    h.asserter.push_success(&U64::from(LOADED + 4));
+    h.feed
+      .send(FeedEvent::Block(block(LOADED + 4, false)))
+      .await
+      .unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), h.chain.changes())
+      .await
+      .expect("changes waited on a reload")
+      .unwrap();
+    assert!(update.reload && update.restart, "{update:?}");
+    assert_eq!(h.asserter.read_q().len(), 1, "a pool reload ran");
   }
 
   /// A V4 pool whose block moves it near its tick window's edge gets a refetch.
@@ -974,13 +1014,5 @@ mod tests {
     };
     std::fs::write(&path, format!("{}\n{}\n{}\n", line(4), line(9), line(7))).unwrap();
     assert_eq!(first_id(&path).await.unwrap(), 10);
-  }
-
-  /// The feed lag is the time past the block's timestamp, never negative.
-  #[test]
-  fn feed_lag_from_block_time() {
-    let now = UNIX_EPOCH + Duration::from_millis(100_250);
-    assert_eq!(lag_ms(100, now), 250);
-    assert_eq!(lag_ms(101, now), 0);
   }
 }

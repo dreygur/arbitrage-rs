@@ -45,8 +45,6 @@ pub struct FeedBlock {
   pub gas_used: u64,
   /// Gas limit of the block.
   pub gas_limit: u64,
-  /// Block timestamp in Unix seconds, against which the feed lag is measured.
-  pub timestamp: u64,
   /// When the feed saw the head, where a trade's latency stages start.
   pub seen: Instant,
   /// Logs of tracked pools, as the node returned them.
@@ -212,7 +210,6 @@ impl<P: Provider + Send + Sync + 'static> Feed<P> {
         .unwrap_or_default(),
       gas_used: header.inner.gas_used,
       gas_limit: header.inner.gas_limit,
-      timestamp: header.inner.timestamp,
       seen,
       logs: logs
         .into_iter()

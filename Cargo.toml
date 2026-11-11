@@ -20,6 +20,9 @@ toml = "1"
 dotenvy = "0.15"
 eyre = "0.6"
 rayon = "1"
+ratatui = "0.30"
+url = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 criterion = "0.8"

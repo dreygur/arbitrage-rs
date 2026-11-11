@@ -164,12 +164,15 @@ pub struct MockChain {
   pub submits: Mutex<Vec<Vec<Opportunity>>>,
   /// Number of `cost` calls.
   pub cost_calls: AtomicUsize,
-  /// Every command passed to `control`.
-  pub controls: Mutex<Vec<Control>>,
-  /// Value returned by `in_flight`.
-  pub in_flight: AtomicUsize,
-  /// Value returned by `status`.
-  pub status: Mutex<Status>,
+  /// Every command passed to `control`, shareable like `in_flight`.
+  pub controls: Arc<Mutex<Vec<Control>>>,
+  /// Value returned by `in_flight`, shareable so a test can hold it for a chain the code
+  /// under test builds.
+  pub in_flight: Arc<AtomicUsize>,
+  /// Value returned by `status`, shareable like `in_flight`.
+  pub status: Arc<Mutex<Status>>,
+  /// Every live setting passed to `apply_live`.
+  pub lives: Mutex<Vec<Live>>,
 }
 
 impl MockChain {
@@ -184,20 +187,21 @@ impl MockChain {
       replies: Mutex::new(VecDeque::new()),
       submits: Mutex::new(Vec::new()),
       cost_calls: AtomicUsize::new(0),
-      controls: Mutex::new(Vec::new()),
-      in_flight: AtomicUsize::new(0),
-      status: Mutex::new(Status {
+      controls: Arc::new(Mutex::new(Vec::new())),
+      in_flight: Arc::new(AtomicUsize::new(0)),
+      lives: Mutex::new(Vec::new()),
+      status: Arc::new(Mutex::new(Status {
         block: 0,
         next_base_fee: 0,
         fee_cap: 0,
         max_fee_per_gas: 0,
-        feed_lag_ms: 0,
+        head_age_ms: 0,
         executor: String::new(),
         executor_balance: Amount::ZERO,
         treasury: String::new(),
         treasury_balance: Amount::ZERO,
         accounts: Vec::new(),
-      }),
+      })),
     }
   }
 
@@ -258,8 +262,10 @@ impl Chain for MockChain {
     ops.into_iter().map(|op| (op, verdict)).collect()
   }
 
-  /// Ignores live settings.
-  fn apply_live(&self, _live: &Live) {}
+  /// Records the live settings.
+  fn apply_live(&self, live: &Live) {
+    self.lives.lock().unwrap().push(live.clone());
+  }
 
   /// Records the command.
   fn control(&self, command: Control) {

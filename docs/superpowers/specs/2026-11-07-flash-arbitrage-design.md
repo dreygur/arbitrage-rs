@@ -274,9 +274,10 @@ The SDK has no protocol fee input, so a pool with a non zero protocol
 fee is priced per direction with the fee the PoolManager charges:
 `swap_fee = protocol + lp - protocol * lp / 1_000_000` in pips, where
 `protocol` is the low 12 bits of `protocolFee` for zero for one and the
-high 12 bits for one for zero (Uniswap's `ProtocolFeeLibrary`). Native ETH and WETH are one asset to the
-core: the adapter reports native as the WETH id and remembers each
-pool's real currency for the executor.
+high 12 bits for one for zero (Uniswap's `ProtocolFeeLibrary`).
+Native ETH and WETH are one asset to the core: the adapter reports
+native as the WETH id and remembers each pool's real currency for the
+executor.
 
 An EVM network needs a V4 PoolManager and StateView, a wrapped native
 token (set as `base_token` and passed to the executor), and multicall.

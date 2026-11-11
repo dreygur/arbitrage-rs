@@ -16,11 +16,15 @@ const OUT_OF_GAS_RAISE: (u64, u64) = (3, 2);
 const BUMP: (u128, u128) = (11, 10);
 /// The share a call frame keeps back from the call it makes under EIP 150, `1 / 64`.
 const OUT_OF_GAS_SLACK: u64 = 64;
-/// Calls between a trade transaction and its deepest frame: the executor calls the
-/// PoolManager, which calls back into the executor, which calls a pool, which calls a token
-/// (or the PoolManager again), and one more for margin. Each keeps back its `1 / 64`, so a
-/// trade that runs out of gas at the bottom leaves that much of the limit unused.
-const CALL_DEPTH: u32 = 5;
+/// Nested frames whose `1 / 64` a revert may leave unused and still count as out of gas.
+///
+/// Two match what the fork measured: trades that ran out of gas left 2.7% of their limit
+/// unused (243,206 of 250,000, 272,944 of 280,000, 292,025 of 300,000), and two frames allow
+/// 3.1%. More would also catch a trade that ran both legs and then reverted `NoProfit`: the
+/// learned limit is only 20% over a post-refund `gasUsed`, a revert gets no refund, so such a
+/// trade can use 94% of the limit, and counting it as out of gas would raise the limit by 1.5
+/// for good on every stale trade.
+const CALL_DEPTH: u32 = 2;
 
 /// The base fee of the block after one with `parent_base_fee`, `gas_used` and `gas_limit`,
 /// by the EIP 1559 formula: a full block raises it 12.5%, an empty one lowers it 12.5%.
@@ -258,5 +262,28 @@ mod tests {
     assert_eq!(gas.limit(0), 250_000);
     gas.record(0, 243_206, 250_000, true);
     assert_eq!(gas.limit(0), 375_000);
+  }
+
+  /// Every out of gas receipt the fork gave still counts as out of gas: V2 against V2 at
+  /// 250,000 and 280,000, V2 against V4 at 300,000.
+  #[test]
+  fn fork_out_of_gas_receipts_detected() {
+    for (used, limit) in [(243_206, 250_000), (272_944, 280_000), (292_025, 300_000)] {
+      assert!(out_of_gas(used, limit), "{used} of {limit}");
+    }
+  }
+
+  /// A trade that reverts after running both legs, as a stale `NoProfit` does, at the limit
+  /// learned from a success leaves that limit alone. The limit is 20% over the post-refund
+  /// `gasUsed` of the fork's V2 against V4 success, 239,869, and a revert earns no refund,
+  /// so it spends close to the full execution: 270,000 here, 93.8% of the limit.
+  #[test]
+  fn full_execution_revert_keeps_learned_limit() {
+    let mut gas = GasLimits::new(&mock_evm_config());
+    gas.record(1, 239_869, 300_000, false);
+    let learned = gas.limit(1);
+    assert_eq!(learned, 287_842);
+    gas.record(1, 270_000, learned, true);
+    assert_eq!(gas.limit(1), learned);
   }
 }

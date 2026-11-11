@@ -147,7 +147,7 @@ pub enum Verdict {
   GasCap,
   /// Quoting failed.
   QuoteError,
-  /// The pair is locked by an in flight trade until the given block.
+  /// The pair is locked by the in flight trade with the given id until it settles.
   Locked(u64),
   /// The sending account is low on gas funds.
   LowGas,
@@ -300,8 +300,22 @@ pub struct AccountStatus {
   pub low_gas: bool,
 }
 
-/// Snapshot of the whole bot for the dashboard.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Where the supervisor is in building and running a chain, so the screen can tell a
+/// connect or rebuild that takes minutes from a hang.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+  /// The first chain is being built; nothing has a status yet.
+  #[default]
+  Connecting,
+  /// A restart dropped the chain and is building the next one.
+  Rebuilding,
+  /// A chain is built and the bot runs over it.
+  Running,
+}
+
+/// Snapshot of the whole bot for the dashboard. The default is the empty one the screen's
+/// channel starts with, shown as zeros until the first chain is built.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
   /// Latest block seen.
   pub block: u64,
@@ -311,8 +325,10 @@ pub struct Status {
   pub fee_cap: u128,
   /// Configured ceiling on fee per gas.
   pub max_fee_per_gas: u128,
-  /// Delay of the feed behind the chain head, in milliseconds.
-  pub feed_lag_ms: u64,
+  /// Time since the feed last delivered a head, in milliseconds, measured when the status
+  /// is read: near zero on a healthy feed and growing while it stalls; zero before the
+  /// first head.
+  pub head_age_ms: u64,
   /// Executor contract address.
   pub executor: String,
   /// Executor balance in the base token.
@@ -325,6 +341,21 @@ pub struct Status {
   pub treasury_balance: Amount,
   /// Per account snapshots.
   pub accounts: Vec<AccountStatus>,
+}
+
+/// Outcome of a config reload, shown on the screen so a bad edit is seen without reading
+/// logs: the bot keeps its old settings when `error` is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadEvent {
+  /// One line per setting that changed.
+  pub changes: Vec<String>,
+  /// Why the new config was refused, when it was.
+  pub error: Option<String>,
+  /// The accepted config's text, so the config tab shows what now runs; absent when refused.
+  pub config: Option<String>,
+  /// The accepted config's `executor_max_hold`, so the holdings panel shows the cap that
+  /// now applies; absent when refused.
+  pub executor_cap: Option<Amount>,
 }
 
 #[cfg(test)]

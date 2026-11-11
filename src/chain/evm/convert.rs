@@ -3,6 +3,7 @@
 use alloy::primitives::Address;
 
 use crate::error::{Error, Result};
+use crate::redact::redact;
 use crate::types::Id;
 
 /// Length of an EVM address in bytes.
@@ -26,16 +27,18 @@ pub fn to_id(address: Address) -> Id {
 }
 
 impl From<alloy::transports::TransportError> for Error {
-  /// Maps a transport failure to an RPC error.
+  /// Maps a transport failure to an RPC error, redacted, since reqwest quotes the node URL
+  /// and with it any key.
   fn from(e: alloy::transports::TransportError) -> Self {
-    Self::Rpc(e.to_string())
+    Self::Rpc(redact(&e.to_string()))
   }
 }
 
 impl From<alloy::contract::Error> for Error {
-  /// Maps a contract call failure to a contract error.
+  /// Maps a contract call failure to a contract error, redacted, since it can wrap a
+  /// transport error that quotes the node URL.
   fn from(e: alloy::contract::Error) -> Self {
-    Self::Contract(e.to_string())
+    Self::Contract(redact(&e.to_string()))
   }
 }
 
@@ -48,6 +51,20 @@ mod tests {
   fn address_roundtrip() {
     let address = Address::repeat_byte(0x42);
     assert_eq!(to_address(&to_id(address)).unwrap(), address);
+  }
+
+  /// A transport error quoting a keyed node URL loses the key on its way into an
+  /// [`Error`].
+  #[test]
+  fn transport_error_redacted() {
+    let url = "https://node.example/v2/SECRETKEY";
+    crate::redact::register(url);
+    let transport = alloy::transports::TransportErrorKind::custom_str(&format!(
+      "error sending request for url ({url})"
+    ));
+    let text = Error::from(transport).to_string();
+    assert!(!text.contains("SECRETKEY"), "{text}");
+    assert!(text.starts_with("rpc: "), "{text}");
   }
 
   /// An id that is not 20 bytes is not an address.

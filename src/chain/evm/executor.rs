@@ -8,6 +8,7 @@
 //! logged before each is sent.
 
 use std::collections::{BTreeSet, HashSet};
+use std::future::IntoFuture;
 use std::path::Path;
 
 use alloy::eips::BlockNumberOrTag;
@@ -23,6 +24,10 @@ use crate::error::{Error, Result};
 
 /// Gas limit headroom over the node's estimate, as `6 / 5` (20%).
 const HEADROOM: (u64, u64) = (6, 5);
+/// JSON-RPC error code nodes use for a call that reverted.
+const REVERT_CODE: i64 = 3;
+/// Message of a call that reverted, sent by some nodes under another code.
+const REVERTED: &str = "execution reverted";
 
 /// The executor a previous run deployed, saved as JSON so the next run can find it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,26 +110,104 @@ pub enum ExecutorAction {
   Deploy,
 }
 
-/// Reuses the recorded executor only when it has code and was deployed on this chain by this
-/// owner for this treasury, since the treasury is immutable and only the owner can sweep.
+/// Reuses the recorded executor only when it has code, the contract there `fits` (its own
+/// owner, treasury, PoolManager and wrapped native token match the config, as read from
+/// it) and the record is for this chain. The treasury is immutable and only the owner can
+/// sweep, so a contract that does not fit must never get trades.
 pub fn executor_action(
   record: Option<&ExecutorRecord>,
   code_present: bool,
-  owner: Address,
-  treasury: Address,
+  fits: bool,
   chain_id: u64,
 ) -> ExecutorAction {
   match record {
-    Some(record)
-      if code_present
-        && record.owner == owner
-        && record.treasury == treasury
-        && record.chain_id == chain_id =>
-    {
+    Some(record) if code_present && fits && record.chain_id == chain_id => {
       ExecutorAction::Reuse(record.address)
     }
     _ => ExecutorAction::Deploy,
   }
+}
+
+/// Whether a node error response with `code` and `message` says the call itself reverted:
+/// JSON-RPC code 3, or an "execution reverted" message, which some nodes send under
+/// another code.
+fn is_revert(code: i64, message: &str) -> bool {
+  code == REVERT_CODE || message.contains(REVERTED)
+}
+
+/// The address an immutable getter returned, or `None` when the contract does not answer
+/// it (an execution revert, no data, or data that does not decode), which marks a
+/// contract that is not ours.
+///
+/// Every other failure is an error, never a mismatch: a rate limit, a pruned state or an
+/// internal node error proves nothing about the contract, and reading it as "not ours"
+/// would redeploy and forget an executor that may still hold profit.
+async fn immutable(
+  call: impl IntoFuture<Output = std::result::Result<Address, alloy::contract::Error>>,
+) -> Result<Option<Address>> {
+  match call.await {
+    Ok(address) => Ok(Some(address)),
+    Err(alloy::contract::Error::ZeroData(..) | alloy::contract::Error::AbiError(_)) => Ok(None),
+    Err(alloy::contract::Error::TransportError(e))
+      if e
+        .as_error_resp()
+        .is_some_and(|payload| is_revert(payload.code, &payload.message)) =>
+    {
+      Ok(None)
+    }
+    Err(e) => Err(e.into()),
+  }
+}
+
+/// Whether the contract at `address` was built for this config: its `owner()`,
+/// `treasury()`, `pm()` and `weth()` must match. After a refork the recorded address can
+/// hold someone else's contract, which the record file alone cannot tell.
+async fn executor_fits<P: Provider>(
+  provider: &P,
+  address: Address,
+  owner: Address,
+  treasury: Address,
+  pool_manager: Address,
+  weth: Address,
+) -> Result<bool> {
+  let contract = FlashArbitrage::new(address, provider);
+  if immutable(contract.owner().call()).await? != Some(owner) {
+    return Ok(false);
+  }
+  if immutable(contract.treasury().call()).await? != Some(treasury) {
+    return Ok(false);
+  }
+  if immutable(contract.pm().call()).await? != Some(pool_manager) {
+    return Ok(false);
+  }
+  Ok(immutable(contract.weth().call()).await? == Some(weth))
+}
+
+/// Decides whether to reuse the executor in `record` or deploy a new one, reading its code
+/// and immutables from the chain.
+async fn plan_executor<P: Provider>(
+  provider: &P,
+  record: Option<&ExecutorRecord>,
+  evm: &EvmConfig,
+  weth: Address,
+  treasury: Address,
+  owner: Address,
+) -> Result<ExecutorAction> {
+  let Some(found) = record else {
+    return Ok(ExecutorAction::Deploy);
+  };
+  let code_present = !provider.get_code_at(found.address).await?.is_empty();
+  let fits = code_present
+    && executor_fits(
+      provider,
+      found.address,
+      owner,
+      treasury,
+      evm.pool_manager,
+      weth,
+    )
+    .await?;
+  Ok(executor_action(record, code_present, fits, evm.chain_id))
 }
 
 /// Reads the record at `path`, `None` when the file does not exist.
@@ -207,9 +290,9 @@ async fn apply_operators<P: Provider>(
 }
 
 /// Returns the executor to trade through, deploying one when the record at `record_path` is
-/// missing or no longer fits. A reused executor gets `setOperator` for every configured
-/// operator it lacks and a revoke for every recorded operator no longer configured; the
-/// record then lists the configured operators.
+/// missing or the contract it names no longer fits. A reused executor gets `setOperator`
+/// for every configured operator it lacks and a revoke for every recorded operator no
+/// longer configured; the record then lists the configured operators.
 ///
 /// `provider` must send from `owner`, which becomes the owner of a new deployment. A corrupt
 /// record is an error rather than a redeploy, so an executor still holding profit is not
@@ -224,10 +307,7 @@ pub async fn ensure_executor<P: Provider>(
   operators: &[Address],
 ) -> Result<Address> {
   let record = read_record(record_path)?;
-  let code_present = match &record {
-    Some(record) => !provider.get_code_at(record.address).await?.is_empty(),
-    None => false,
-  };
+  let action = plan_executor(provider, record.as_ref(), evm, weth, treasury, owner).await?;
   let fresh = |address| ExecutorRecord {
     address,
     owner,
@@ -235,7 +315,7 @@ pub async fn ensure_executor<P: Provider>(
     chain_id: evm.chain_id,
     operators: operators.to_vec(),
   };
-  match executor_action(record.as_ref(), code_present, owner, treasury, evm.chain_id) {
+  match action {
     ExecutorAction::Reuse(address) => {
       info!(%address, "reusing executor");
       let recorded = record.map(|r| r.operators).unwrap_or_default();
@@ -300,6 +380,11 @@ mod tests {
     }
   }
 
+  /// The configured wrapped native token.
+  fn weth() -> Address {
+    Address::repeat_byte(0xee)
+  }
+
   /// Operator `n`.
   fn operator(n: u8) -> Address {
     Address::repeat_byte(n)
@@ -345,6 +430,24 @@ mod tests {
     assert!(operator_changes(&configured, &configured, &in_place).is_empty());
   }
 
+  /// Answers the code read and the four immutable reads of an executor whose owner is
+  /// `owner` and whose other immutables match the config.
+  fn mock_immutables(asserter: &Asserter, owner: Address) {
+    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    asserter.push_success(&Bytes::from(FlashArbitrage::ownerCall::abi_encode_returns(
+      &owner,
+    )));
+    asserter.push_success(&Bytes::from(
+      FlashArbitrage::treasuryCall::abi_encode_returns(&treasury()),
+    ));
+    asserter.push_success(&Bytes::from(FlashArbitrage::pmCall::abi_encode_returns(
+      &mock_evm_config().pool_manager,
+    )));
+    asserter.push_success(&Bytes::from(FlashArbitrage::wethCall::abi_encode_returns(
+      &weth(),
+    )));
+  }
+
   /// A reused executor whose operators all match sends no transaction and keeps its record.
   #[tokio::test]
   async fn reuse_with_operators_in_place_sends_nothing() {
@@ -353,7 +456,7 @@ mod tests {
     let path = dir.join(".arbitrage-test.json");
     write_record(&path, &record()).unwrap();
     let asserter = Asserter::new();
-    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    mock_immutables(&asserter, owner());
     asserter.push_success(&Bytes::from(
       FlashArbitrage::operatorsCall::abi_encode_returns(&true),
     ));
@@ -361,7 +464,7 @@ mod tests {
       &mock_provider(&asserter),
       &path,
       &mock_evm_config(),
-      Address::repeat_byte(0xee),
+      weth(),
       treasury(),
       owner(),
       &[operator(2)],
@@ -386,28 +489,23 @@ mod tests {
     assert!(matches!(read_record(&path), Err(Error::Config(_))));
   }
 
-  /// A record with code behind it and the configured owner, treasury and chain is reused.
+  /// A record with code behind it that fits the config, on this chain, is reused.
   #[test]
-  fn reuse_when_code_and_owner_match() {
-    let action = executor_action(Some(&record()), true, owner(), treasury(), 1);
+  fn reuse_when_code_and_contract_fit() {
+    let action = executor_action(Some(&record()), true, true, 1);
     assert_eq!(action, ExecutorAction::Reuse(record().address));
   }
 
-  /// Another owner, treasury or chain means a new deployment.
+  /// A contract that does not fit, or a record for another chain, means a new deployment.
   #[test]
-  fn deploy_when_owner_differs() {
+  fn deploy_when_contract_differs() {
     let r = record();
-    let other = Address::repeat_byte(0x02);
     assert_eq!(
-      executor_action(Some(&r), true, other, treasury(), 1),
+      executor_action(Some(&r), true, false, 1),
       ExecutorAction::Deploy
     );
     assert_eq!(
-      executor_action(Some(&r), true, owner(), other, 1),
-      ExecutorAction::Deploy
-    );
-    assert_eq!(
-      executor_action(Some(&r), true, owner(), treasury(), 31337),
+      executor_action(Some(&r), true, true, 31337),
       ExecutorAction::Deploy
     );
   }
@@ -417,12 +515,96 @@ mod tests {
   #[test]
   fn deploy_when_code_missing() {
     assert_eq!(
-      executor_action(Some(&record()), false, owner(), treasury(), 1),
+      executor_action(Some(&record()), false, false, 1),
       ExecutorAction::Deploy
     );
     assert_eq!(
-      executor_action(None, false, owner(), treasury(), 1),
+      executor_action(None, false, false, 1),
       ExecutorAction::Deploy
     );
+  }
+
+  /// The record names our owner and treasury, but the contract at its address, read from
+  /// the chain, has another owner, as when a refork put a stranger's contract there: a new
+  /// executor is deployed and nothing more is asked of that contract.
+  #[tokio::test]
+  async fn deploy_when_contract_owner_differs() {
+    let asserter = Asserter::new();
+    mock_immutables(&asserter, Address::repeat_byte(0x02));
+    let action = plan_executor(
+      &mock_provider(&asserter),
+      Some(&record()),
+      &mock_evm_config(),
+      weth(),
+      treasury(),
+      owner(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(action, ExecutorAction::Deploy);
+    assert_eq!(asserter.read_q().len(), 3, "read past the owner");
+  }
+
+  /// Queues a node error response with `code` and `message` on `asserter`.
+  fn mock_error(asserter: &Asserter, code: i64, message: &str) {
+    let payload = serde_json::json!({ "code": code, "message": message });
+    asserter.push_failure(serde_json::from_value(payload).unwrap());
+  }
+
+  /// A contract whose `owner()` reverts is not ours, so a new executor is deployed.
+  #[tokio::test]
+  async fn deploy_when_owner_call_reverts() {
+    let asserter = Asserter::new();
+    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    mock_error(&asserter, REVERT_CODE, REVERTED);
+    let action = plan_executor(
+      &mock_provider(&asserter),
+      Some(&record()),
+      &mock_evm_config(),
+      weth(),
+      treasury(),
+      owner(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(action, ExecutorAction::Deploy);
+  }
+
+  /// A node error that is not a revert proves nothing about the contract: the decision
+  /// fails, so connect fails rather than deploying over an executor that may hold profit.
+  #[tokio::test]
+  async fn node_error_on_immutable_is_not_a_mismatch() {
+    let asserter = Asserter::new();
+    asserter.push_success(&Bytes::from(vec![0x60, 0x80]));
+    mock_error(&asserter, -32000, "header not found");
+    let planned = plan_executor(
+      &mock_provider(&asserter),
+      Some(&record()),
+      &mock_evm_config(),
+      weth(),
+      treasury(),
+      owner(),
+    )
+    .await;
+    assert!(matches!(planned, Err(Error::Contract(_))), "{planned:?}");
+  }
+
+  /// A contract whose immutables all match the config is reused.
+  #[tokio::test]
+  async fn reuse_when_contract_immutables_match() {
+    let asserter = Asserter::new();
+    mock_immutables(&asserter, owner());
+    let action = plan_executor(
+      &mock_provider(&asserter),
+      Some(&record()),
+      &mock_evm_config(),
+      weth(),
+      treasury(),
+      owner(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(action, ExecutorAction::Reuse(record().address));
+    assert!(asserter.read_q().is_empty(), "immutables left unread");
   }
 }

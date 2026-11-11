@@ -219,6 +219,34 @@ contract FlashArbitrageTest is Test {
     vm.stopPrank();
   }
 
+  /// @notice Only the owner grants or revokes operators, so neither an operator
+  /// nor a stranger can add another account that may execute trades.
+  function test_set_operator_owner_only() public {
+    vm.prank(OPERATOR);
+    vm.expectRevert(FlashArbitrage.NotOwner.selector);
+    executor.setOperator(address(0xBEEF), true);
+
+    vm.prank(address(0xBEEF));
+    vm.expectRevert(FlashArbitrage.NotOwner.selector);
+    executor.setOperator(address(0xBEEF), true);
+    assertFalse(executor.operators(address(0xBEEF)));
+
+    executor.setOperator(address(0xBEEF), true);
+    assertTrue(executor.operators(address(0xBEEF)));
+  }
+
+  /// @notice Ether a stranger sends is refused, so no balance can appear
+  /// that the profit check would not account for.
+  function test_rejects_stranger_ether() public {
+    address stranger = address(0xBEEF);
+    vm.deal(stranger, 1 ether);
+    vm.prank(stranger);
+    (bool sent, bytes memory reason) = payable(address(executor)).call{value: 1 ether}("");
+    assertFalse(sent);
+    assertEq(reason, abi.encodeWithSelector(FlashArbitrage.UnexpectedSender.selector));
+    assertEq(stranger.balance, 1 ether);
+  }
+
   /// @notice Ether from anyone but WETH or the PoolManager is refused.
   function test_rejects_unexpected_ether() public {
     vm.deal(address(this), 1 ether);
