@@ -325,8 +325,10 @@ pub struct Status {
   pub fee_cap: u128,
   /// Configured ceiling on fee per gas.
   pub max_fee_per_gas: u128,
-  /// Delay of the feed behind the chain head, in milliseconds.
-  pub feed_lag_ms: u64,
+  /// Time since the feed last delivered a head, in milliseconds, measured when the status
+  /// is read: near zero on a healthy feed and growing while it stalls; zero before the
+  /// first head.
+  pub head_age_ms: u64,
   /// Executor contract address.
   pub executor: String,
   /// Executor balance in the base token.

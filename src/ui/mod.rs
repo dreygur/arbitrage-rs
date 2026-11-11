@@ -295,7 +295,7 @@ mod tests {
     }
   }
 
-  /// The header shows the block, feed lag, next base fee and the fee cap against its ceiling.
+  /// The header shows the block, head age, next base fee and the fee cap against its ceiling.
   #[test]
   fn header_shows_fee_against_cap() {
     let mut app = app();
@@ -305,7 +305,7 @@ mod tests {
       next_base_fee: 12 * GWEI,
       fee_cap: 25 * GWEI,
       max_fee_per_gas: 50 * GWEI,
-      feed_lag_ms: 40,
+      head_age_ms: 40,
       executor: "0xexec".into(),
       executor_balance: Amount::ZERO,
       treasury: "0xtreasury".into(),
@@ -317,7 +317,7 @@ mod tests {
     for part in [
       "testnet",
       "block 123",
-      "lag 40ms",
+      "head age 40ms",
       "base 12.0000 gwei",
       "fee cap 25.0000 / 50.0000 gwei",
     ] {

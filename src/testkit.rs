@@ -195,7 +195,7 @@ impl MockChain {
         next_base_fee: 0,
         fee_cap: 0,
         max_fee_per_gas: 0,
-        feed_lag_ms: 0,
+        head_age_ms: 0,
         executor: String::new(),
         executor_balance: Amount::ZERO,
         treasury: String::new(),

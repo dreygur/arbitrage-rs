@@ -130,16 +130,17 @@ fn tab_names(tab: Tab) -> String {
   .join(" ")
 }
 
-/// Network, block, feed lag, next base fee, the fee cap against its ceiling and run state;
-/// while the first chain is built, which can take minutes, a line saying so instead.
+/// Network, block, head age (time since the last head was seen), next base fee, the fee
+/// cap against its ceiling and run state; while the first chain is built, which can take
+/// minutes, a line saying so instead.
 fn header(app: &App) -> String {
   let chain = match (&app.status, app.phase) {
     (_, Phase::Connecting) => format!("connecting to {}, loading pools", app.network),
     (Some(status), _) => format!(
-      "{}  block {}  lag {}ms  base {} gwei  fee cap {} / {} gwei",
+      "{}  block {}  head age {}ms  base {} gwei  fee cap {} / {} gwei",
       app.network,
       status.block,
-      status.feed_lag_ms,
+      status.head_age_ms,
       format_gwei(status.next_base_fee),
       format_gwei(status.fee_cap),
       format_gwei(status.max_fee_per_gas),

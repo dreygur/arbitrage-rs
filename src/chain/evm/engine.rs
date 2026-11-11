@@ -1343,8 +1343,8 @@ impl<P: Provider> Engine<P> {
         next_base_fee: self.next_base_fee.unwrap_or(0),
         fee_cap: self.cap(),
         max_fee_per_gas: self.evm.max_fee_per_gas,
-        // The engine never sees the feed; `EvmChain::status` fills the lag in.
-        feed_lag_ms: 0,
+        // The engine never sees the feed; `EvmChain::status` fills the head age in.
+        head_age_ms: 0,
         executor: self.executor.to_string(),
         executor_balance: self.executor_balance,
         treasury: self.holdings.treasury().to_string(),
@@ -1619,7 +1619,6 @@ mod tests {
       base_fee: 10 * GWEI,
       gas_used: 15_000_000,
       gas_limit: 30_000_000,
-      timestamp: 0,
       seen: Instant::now(),
       logs: Vec::new(),
       gap: false,
